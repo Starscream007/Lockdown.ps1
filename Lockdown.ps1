@@ -1,25 +1,32 @@
 # ============================================================
 #   Lockdown.ps1
 #   Author  : Starscream
-#   Purpose : Detection des repertoires avec ACL Write+Execute
-#             accessibles aux utilisateurs low-priv (AppLocker bypass)
+#   Purpose : Detection of directories with Write+Execute ACL
+#             accessible to low-priv users (AppLocker bypass)
 #             + LOLBAS check + PS v2 + AppLocker cache
+#             + user context simulation (domain or local)
 #
 #   Usage   :
 #     ./Lockdown.ps1
 #     ./Lockdown.ps1 -AllTargets
 #     ./Lockdown.ps1 -Target "C:\Windows","C:\ProgramData"
 #     ./Lockdown.ps1 -AllTargets -Output C:\results.txt
+#     ./Lockdown.ps1 -AsUser "DOMAIN\john"
+#     ./Lockdown.ps1 -AsUser "DOMAIN\john" -Groups "DOMAIN\IT Staff","BUILTIN\Users"
+#     ./Lockdown.ps1 -AsUser "localjohn"
+#     ./Lockdown.ps1 -AsUser "MACHINE\localjohn"
 # ============================================================
 
 [CmdletBinding()]
 param(
     [string[]]$Target,
     [string]$Output,
-    [switch]$AllTargets
+    [switch]$AllTargets,
+    [string]$AsUser,
+    [string[]]$Groups
 )
 
-# Targets 
+# Targets
 $defaultTargets = @(
     $env:windir,
     $env:ProgramData,
@@ -34,13 +41,84 @@ else              { $scanPaths = @($env:windir) }
 
 $count = 0
 
-# Current user 
-$currentUser   = whoami
-$currentGroups = whoami /groups /fo csv 2>$null |
-                 ConvertFrom-Csv |
-                 Select-Object -ExpandProperty "Group Name"
+# Banner
+Write-Host ""
+Write-Host "  ====================================================" -ForegroundColor DarkCyan
+Write-Host "   _     ___   ____ _  ______   _____         ___   _ " -ForegroundColor Cyan
+Write-Host "  | |   / _ \ / ___| |/ /  _ \ / _  \ \      / / \ | |" -ForegroundColor Cyan
+Write-Host "  | |  | | | | |   | ' /| | | | | | |\ \ /\ / /|  \| |" -ForegroundColor Cyan
+Write-Host "  | |__| |_| | |___| . \| |_| | |_| | \ V  V / | |\  |" -ForegroundColor Cyan
+Write-Host "  |_____\___/ \____|_|\_\____/ \___/   \_/\_/  |_| \_|" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "          by Starscream  |  Decepticons Suite"          -ForegroundColor Magenta
+Write-Host "               Peace through tyranny."                  -ForegroundColor Magenta
+Write-Host "  ====================================================" -ForegroundColor DarkCyan
+Write-Host ""
 
-# AppLocker policy (best-effort) 
+# User and group resolution
+function Get-LdapGroups {
+    param([string]$username)
+
+    # Domain attempt
+    try {
+        Add-Type -AssemblyName System.DirectoryServices.AccountManagement -ErrorAction Stop
+        $ctx      = [System.DirectoryServices.AccountManagement.ContextType]::Domain
+        $userPrin = [System.DirectoryServices.AccountManagement.UserPrincipal]::FindByIdentity($ctx, $username)
+        if ($userPrin) {
+            $domain = $userPrin.Context.Name
+            return $userPrin.GetAuthorizationGroups() |
+                   ForEach-Object { "$domain\$($_.SamAccountName)" } |
+                   Where-Object { $_ }
+        }
+    } catch { }
+
+    # Fallback local account via WinNT
+    try {
+        $localUser = $username -replace '.*\\', ''
+        $computer  = $env:COMPUTERNAME
+        $user      = [ADSI]"WinNT://$computer/$localUser,user"
+        $groups    = @()
+        $user.Groups() | ForEach-Object {
+            $grp  = [ADSI]$_.GetType().InvokeMember("AdsPath", 'GetProperty', $null, $_, $null)
+            $groups += "BUILTIN\$($grp.Name[0])"
+        }
+        if ($groups.Count -gt 0) { return $groups }
+    } catch { }
+
+    return $null
+}
+
+$simulationMode = $false
+$ldapResolved   = $false
+
+if ($AsUser) {
+    $simulationMode = $true
+    $currentUser    = $AsUser
+
+    if ($Groups) {
+        $currentGroups = $Groups
+        Write-Host "   [*] Simulation mode : $AsUser (manual groups)" -ForegroundColor Yellow
+    } else {
+        Write-Host "   [*] Attempting LDAP resolution for $AsUser ..." -ForegroundColor Cyan
+        $ldapGroups = Get-LdapGroups -username $AsUser
+        if ($ldapGroups) {
+            $currentGroups = $ldapGroups
+            $ldapResolved  = $true
+            Write-Host "   [+] LDAP OK : $($currentGroups.Count) groups resolved" -ForegroundColor Green
+        } else {
+            $currentGroups = @("NT AUTHORITY\Authenticated Users", "BUILTIN\Users")
+            Write-Host "   [!] LDAP failed : fallback to Authenticated Users + Users" -ForegroundColor Yellow
+            Write-Host "       Use -Groups to pass groups manually"                   -ForegroundColor DarkGray
+        }
+    }
+} else {
+    $currentUser   = whoami
+    $currentGroups = whoami /groups /fo csv 2>$null |
+                     ConvertFrom-Csv |
+                     Select-Object -ExpandProperty "Group Name"
+}
+
+# AppLocker policy (best-effort)
 $appLockerAllowPaths = @()
 $hasAppLocker        = $false
 $appLockerPolicy     = Get-AppLockerPolicy -Effective -ErrorAction SilentlyContinue
@@ -61,7 +139,7 @@ try {
     $hasAppLocker = $true
 } catch { }
 
-# Helper AppLocker dir 
+# AppLocker dir helper
 function Get-AppLockerMatch {
     param([string]$dirPath)
     if (-not $hasAppLocker) { return $null }
@@ -71,7 +149,7 @@ function Get-AppLockerMatch {
     return $false
 }
 
-# Helper AppLocker binaire
+# AppLocker binary helper
 function Get-AppLockerBinaryStatus {
     param([string]$binPath)
     if (-not $hasAppLocker) { return "unknown" }
@@ -87,42 +165,32 @@ function Get-AppLockerBinaryStatus {
     }
 }
 
-# Banner
-$alInfo  = if ($hasAppLocker) { "AppLocker Policy Loaded ($($appLockerAllowPaths.Count) allow paths)" } else { "AppLocker Policy non accessible" }
+# Header — $hasAppLocker known here
+$alInfo  = if ($hasAppLocker) { "AppLocker Policy Loaded ($($appLockerAllowPaths.Count) allow paths)" } else { "AppLocker Policy not accessible" }
 $alColor = if ($hasAppLocker) { "Green" } else { "DarkGray" }
 
+$userLabel   = if ($simulationMode) { "$currentUser [simulation]" } else { $currentUser }
+$groupSource = if ($ldapResolved) { "[LDAP]" } elseif ($simulationMode -and $Groups) { "[manual]" } elseif ($simulationMode) { "[fallback]" } else { "[whoami]" }
+
 Write-Host ""
-Write-Host "  ====================================================" -ForegroundColor DarkCyan
-Write-Host "   _     ___   ____ _  ______   _____         ___   _ " -ForegroundColor Cyan
-Write-Host "  | |   / _ \ / ___| |/ /  _ \ / _  \ \      / / \ | |" -ForegroundColor Cyan
-Write-Host "  | |  | | | | |   | ' /| | | | | | |\ \ /\ / /|  \| |" -ForegroundColor Cyan
-Write-Host "  | |__| |_| | |___| . \| |_| | |_| | \ V  V / | |\  |" -ForegroundColor Cyan
-Write-Host "  |_____\___/ \____|_|\_\____/ \___/   \_/\_/  |_| \_|" -ForegroundColor Cyan
-Write-Host ""
-Write-Host "          by Starscream  |  Decepticons Suite"          -ForegroundColor Magenta
-Write-Host "               Peace through tyranny."                  -ForegroundColor Magenta
-Write-Host "  ====================================================" -ForegroundColor DarkCyan
-Write-Host ""
-Write-Host ""
-Write-Host ""
-Write-Host "   User       : $currentUser"                           -ForegroundColor Cyan
-Write-Host "   Groupes    :"                                        -ForegroundColor Cyan
+Write-Host "   User       : $userLabel"   -ForegroundColor Cyan
+Write-Host "   Groups     : $groupSource" -ForegroundColor Cyan
 $currentGroups | ForEach-Object {
-    Write-Host "               $_"                                  -ForegroundColor Yellow
+    Write-Host "               $_"         -ForegroundColor Yellow
 }
-Write-Host "   AppLocker  : $alInfo"                                -ForegroundColor $alColor
+Write-Host "   AppLocker  : $alInfo"      -ForegroundColor $alColor
 Write-Host "  ============================================="        -ForegroundColor DarkCyan
 
 if ($Output) {
     "Lockdown.ps1 | $(Get-Date -Format 'yyyy-MM-dd HH:mm')" | Out-File $Output
-    "User      : $currentUser"  | Add-Content $Output
-    "Groupes   :"               | Add-Content $Output
+    "User      : $userLabel"    | Add-Content $Output
+    "Groups    : $groupSource"  | Add-Content $Output
     $currentGroups | ForEach-Object { "    $_" | Add-Content $Output }
     "AppLocker : $alInfo"       | Add-Content $Output
     ""                          | Add-Content $Output
 }
 
-# Scan ACL's 
+# ACL Scan
 foreach ($scanPath in $scanPaths) {
     Write-Host ""
     Write-Host "  [*] Analyzing $scanPath" -ForegroundColor Cyan
@@ -178,7 +246,7 @@ foreach ($scanPath in $scanPaths) {
                 }
             }
         } catch {
-            # Access denied silencieux
+            # Access denied — silent
         }
     }
 }
@@ -210,8 +278,14 @@ if ($Output) {
 
 foreach ($bin in $lolbas) {
 
-    # Paths non-standard
-    if ($bin -eq "msbuild.exe") {
+    if ($bin -eq "installutil.exe") {
+        $binPath = Get-ChildItem "$env:windir\Microsoft.NET\Framework64" -Recurse -Filter "installutil.exe" -ErrorAction SilentlyContinue |
+                   Select-Object -First 1 -ExpandProperty FullName
+        if (-not $binPath) {
+            $binPath = Get-ChildItem "$env:windir\Microsoft.NET\Framework" -Recurse -Filter "installutil.exe" -ErrorAction SilentlyContinue |
+                       Select-Object -First 1 -ExpandProperty FullName
+        }
+    } elseif ($bin -eq "msbuild.exe") {
         $binPath = Get-ChildItem "$env:windir\Microsoft.NET\Framework*" -Recurse -Filter "msbuild.exe" -ErrorAction SilentlyContinue |
                    Select-Object -First 1 -ExpandProperty FullName
     } elseif ($bin -eq "winget.exe") {
@@ -222,8 +296,8 @@ foreach ($bin in $lolbas) {
     }
 
     if (-not $binPath -or -not (Test-Path $binPath)) {
-        Write-Host "    [-] $bin : absent"                    -ForegroundColor DarkGray
-        if ($Output) { "    [-] $bin : absent" | Add-Content $Output }
+        Write-Host "    [-] $bin : not found"                  -ForegroundColor DarkGray
+        if ($Output) { "    [-] $bin : not found" | Add-Content $Output }
         continue
     }
 
@@ -231,16 +305,16 @@ foreach ($bin in $lolbas) {
 
     switch ($status) {
         "allowed" {
-            Write-Host "    [+] $bin : disponible [AL:Allow]" -ForegroundColor Green
-            if ($Output) { "    [+] $bin : disponible [AL:Allow]" | Add-Content $Output }
+            Write-Host "    [+] $bin : available [AL:Allow]" -ForegroundColor Green
+            if ($Output) { "    [+] $bin : available [AL:Allow]" | Add-Content $Output }
         }
         "denied"  {
-            Write-Host "    [-] $bin : bloque [AL:Deny]"      -ForegroundColor Red
-            if ($Output) { "    [-] $bin : bloque [AL:Deny]" | Add-Content $Output }
+            Write-Host "    [-] $bin : blocked [AL:Deny]"    -ForegroundColor Red
+            if ($Output) { "    [-] $bin : blocked [AL:Deny]" | Add-Content $Output }
         }
         default   {
-            Write-Host "    [?] $bin : present [AL:inconnu]"  -ForegroundColor Yellow
-            if ($Output) { "    [?] $bin : present [AL:inconnu]" | Add-Content $Output }
+            Write-Host "    [?] $bin : present [AL:unknown]" -ForegroundColor Yellow
+            if ($Output) { "    [?] $bin : present [AL:unknown]" | Add-Content $Output }
         }
     }
 }
@@ -262,14 +336,14 @@ $ps2reg = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\PowerShell\1\PowerShellEngi
           -ErrorAction SilentlyContinue
 
 if ($ps2reg -and $ps2reg.PowerShellVersion -eq "2.0") {
-    Write-Host "    [+] PowerShell v2 : disponible [CL bypass + logging bypass]" -ForegroundColor Green
-    if ($Output) { "    [+] PowerShell v2 : disponible [CL bypass + logging bypass]" | Add-Content $Output }
+    Write-Host "    [+] PowerShell v2 : available [CLM + logging bypass]" -ForegroundColor Green
+    if ($Output) { "    [+] PowerShell v2 : available [CLM + logging bypass]" | Add-Content $Output }
 } else {
-    Write-Host "    [-] PowerShell v2 : absent ou desactive"                     -ForegroundColor DarkGray
-    if ($Output) { "    [-] PowerShell v2 : absent ou desactive" | Add-Content $Output }
+    Write-Host "    [-] PowerShell v2 : absent or disabled"               -ForegroundColor DarkGray
+    if ($Output) { "    [-] PowerShell v2 : absent or disabled" | Add-Content $Output }
 }
 
-# AppLocker Cache Check 
+# AppLocker Cache Check
 Write-Host ""
 Write-Host "  =============================================" -ForegroundColor DarkCyan
 Write-Host "   AppLocker Cache Checker"                     -ForegroundColor Cyan
@@ -286,14 +360,14 @@ $cacheDir   = "$env:windir\System32\AppLocker"
 $cacheFiles = @("AppCache.dat", "AppCache.dat.LOG1", "AppCache.dat.LOG2")
 
 if (-not (Test-Path $cacheDir)) {
-    Write-Host "    [-] $cacheDir : absent"                  -ForegroundColor DarkGray
-    if ($Output) { "    [-] $cacheDir : absent" | Add-Content $Output }
+    Write-Host "    [-] $cacheDir : not found"              -ForegroundColor DarkGray
+    if ($Output) { "    [-] $cacheDir : not found" | Add-Content $Output }
 } else {
     foreach ($cf in $cacheFiles) {
         $cfPath = Join-Path $cacheDir $cf
         if (-not (Test-Path $cfPath)) {
-            Write-Host "    [-] $cf : absent"                -ForegroundColor DarkGray
-            if ($Output) { "    [-] $cf : absent" | Add-Content $Output }
+            Write-Host "    [-] $cf : not found"            -ForegroundColor DarkGray
+            if ($Output) { "    [-] $cf : not found" | Add-Content $Output }
             continue
         }
         try {
@@ -309,24 +383,24 @@ if (-not (Test-Path $cacheDir)) {
                 Write-Host "    [+] $cf : writable [cache poisoning possible]" -ForegroundColor Green
                 if ($Output) { "    [+] $cf : writable [cache poisoning possible]" | Add-Content $Output }
             } else {
-                Write-Host "    [-] $cf : non writable"                        -ForegroundColor DarkGray
-                if ($Output) { "    [-] $cf : non writable" | Add-Content $Output }
+                Write-Host "    [-] $cf : not writable"                        -ForegroundColor DarkGray
+                if ($Output) { "    [-] $cf : not writable" | Add-Content $Output }
             }
         } catch {
-            Write-Host "    [?] $cf : acces refuse"                            -ForegroundColor Yellow
-            if ($Output) { "    [?] $cf : acces refuse" | Add-Content $Output }
+            Write-Host "    [?] $cf : access denied"                           -ForegroundColor Yellow
+            if ($Output) { "    [?] $cf : access denied" | Add-Content $Output }
         }
     }
 }
 
-# Footer 
+# Footer
 Write-Host ""
 Write-Host "  =============================================" -ForegroundColor DarkCyan
-Write-Host "   $count repertoire(s) trouve(s)"             -ForegroundColor Yellow
+Write-Host "   $count director(ies) found"                 -ForegroundColor Yellow
 if ($Output) {
-    Write-Host "   Resultats exportes : $Output"           -ForegroundColor DarkGray
+    Write-Host "   Results exported : $Output"             -ForegroundColor DarkGray
 }
 Write-Host "  =============================================" -ForegroundColor DarkCyan
 Write-Host ""
-Write-Host "Conquest is made of the ashes of one's enemies." -ForegroundColor DarkCyan
+Write-Host "  Conquest is made of the ashes of one's enemies..." -ForegroundColor DarkCyan
 Write-Host ""
