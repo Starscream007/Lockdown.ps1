@@ -28,7 +28,8 @@ PowerShell AppLocker enumeration tool — ACL misconfiguration detection, LOLBAS
 | ACL Scan | Writable + Executable directories accessible to low-priv users |
 | AppLocker Cross-check | Identifies directories within AppLocker Allow paths |
 | LOLBAS Checker | installutil, rundll32, regsvr32, mshta, wscript, cscript, msbuild, certutil, winget |
-| PowerShell v2 | Detects availability (CLM + logging bypass) |
+| Language Mode | Detects FullLanguage / ConstrainedLanguage / RestrictedLanguage / NoLanguage with bypass implications |
+| PowerShell v2 | Detects availability (CLM + logging bypass) — cross-referenced with Language Mode |
 | AppLocker Cache | Checks AppCache.dat writability (cache poisoning vector) |
 
 ## Parameters
@@ -39,6 +40,18 @@ PowerShell AppLocker enumeration tool — ACL misconfiguration detection, LOLBAS
 | `-Output` | Export results to file |
 | `-AsUser` | Simulate another user context (domain or local) |
 | `-Groups` | Manually specify groups for the simulated user (bypasses LDAP) |
+
+## Language Mode detection
+Lockdown detects the current PowerShell Language Mode and surfaces actionable bypass paths:
+
+| Mode | Meaning | Implication |
+|---|---|---|
+| `FullLanguage` | No restrictions | Clean execution environment |
+| `ConstrainedLanguage` | CLM active | AppLocker likely enforced — PS v2 bypass if available, LOLBAS may still work |
+| `RestrictedLanguage` | Severely restricted | No cmdlets, no variables |
+| `NoLanguage` | Fully disabled | Script execution blocked |
+
+When `ConstrainedLanguage` is detected and PowerShell v2 is available, Lockdown flags the combination as an actionable bypass vector.
 
 ## User context simulation
 When `-AsUser` is provided, Lockdown resolves the target user's group memberships and runs the ACL scan as if executing from that account — without opening a session or generating logon events.
