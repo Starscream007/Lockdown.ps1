@@ -248,7 +248,7 @@ foreach ($scanPath in $scanPaths) {
                 }
             }
         } catch {
-            # Access denied â€” silent
+            # Access denied - silent
         }
     }
 }
@@ -378,17 +378,39 @@ if ($Output) {
     ""                    | Add-Content $Output
 }
 
-$ps2reg = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\PowerShell\1\PowerShellEngine" `
-          -ErrorAction SilentlyContinue
+$ps2reg     = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\PowerShell\1\PowerShellEngine" `
+              -ErrorAction SilentlyContinue
+$ps2regOk   = $ps2reg -and $ps2reg.PowerShellVersion -eq "2.0"
 
-if ($ps2reg -and $ps2reg.PowerShellVersion -eq "2.0") {
+# Check Windows feature (requires elevation, best-effort)
+$ps2feature = $null
+$netFx3     = $null
+try {
+    $ps2feature = Get-WindowsOptionalFeature -Online -FeatureName "MicrosoftWindowsPowerShellV2Root" -ErrorAction Stop
+    $netFx3     = Get-WindowsOptionalFeature -Online -FeatureName "NetFx3" -ErrorAction Stop
+} catch { }
+
+$ps2featureOk = $ps2feature -and $ps2feature.State -eq "Enabled"
+$netFx3Ok     = $netFx3 -and $netFx3.State -eq "Enabled"
+
+if ($ps2regOk -and $ps2featureOk -and $netFx3Ok) {
+    # Registry + feature + .NET 3.5 all OK
     if ($langMode -eq "ConstrainedLanguage") {
-        Write-Host "    [+] PowerShell v2 : available [CLM + logging bypass â€” use it]" -ForegroundColor Green
-        if ($Output) { "    [+] PowerShell v2 : available [CLM + logging bypass â€” use it]" | Add-Content $Output }
+        Write-Host "    [+] PowerShell v2 : available [CLM + logging bypass - use it]" -ForegroundColor Green
+        if ($Output) { "    [+] PowerShell v2 : available [CLM + logging bypass - use it]" | Add-Content $Output }
     } else {
         Write-Host "    [+] PowerShell v2 : available [CLM + logging bypass]" -ForegroundColor Green
         if ($Output) { "    [+] PowerShell v2 : available [CLM + logging bypass]" | Add-Content $Output }
     }
+} elseif ($ps2regOk -and $null -eq $ps2feature) {
+    # Registry OK but feature check failed (no elevation) - inconclusive
+    Write-Host "    [?] PowerShell v2 : registry present but runtime unverified [run as admin to confirm]" -ForegroundColor Yellow
+    if ($Output) { "    [?] PowerShell v2 : registry present but runtime unverified [run as admin to confirm]" | Add-Content $Output }
+} elseif ($ps2regOk -and (-not $ps2featureOk -or -not $netFx3Ok)) {
+    # Registry OK but feature or .NET 3.5 disabled
+    $reason = if (-not $netFx3Ok) { "NetFx3 disabled" } else { "PSv2 feature disabled" }
+    Write-Host "    [-] PowerShell v2 : registry present but runtime unavailable [$reason]" -ForegroundColor Red
+    if ($Output) { "    [-] PowerShell v2 : registry present but runtime unavailable [$reason]" | Add-Content $Output }
 } else {
     Write-Host "    [-] PowerShell v2 : absent or disabled"               -ForegroundColor DarkGray
     if ($Output) { "    [-] PowerShell v2 : absent or disabled" | Add-Content $Output }
@@ -455,4 +477,3 @@ Write-Host "  =============================================" -ForegroundColor Da
 Write-Host ""
 Write-Host "  Conquest is made of the ashes of one's enemies..." -ForegroundColor DarkCyan
 Write-Host ""
-
