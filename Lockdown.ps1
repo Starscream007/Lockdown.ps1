@@ -111,8 +111,8 @@ Write-Host "  | |  | | | | |   | ' /| | | | | | |\ \ /\ / /|  \| |" -ForegroundC
 Write-Host "  | |__| |_| | |___| . \| |_| | |_| | \ V  V / | |\  |" -ForegroundColor Cyan
 Write-Host "  |_____\___/ \____|_|\_\____/ \___/   \_/\_/  |_| \_|" -ForegroundColor Cyan
 Write-Host ""
-Write-Host "        by Starscream  |  Decepticons Suite  [NG]"      -ForegroundColor Magenta
-Write-Host "               Peace through tyranny."                  -ForegroundColor Magenta
+Write-Host "        by Starscream  |  Decepticons Suite"            -ForegroundColor Magenta
+Write-Host "               Peace through tyranny.."                 -ForegroundColor Magenta
 Write-Host "  ====================================================" -ForegroundColor DarkCyan
 Write-Host ""
 
