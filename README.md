@@ -1,8 +1,8 @@
-# Lockdown-NG
+# Lockdown
 
 AppLocker reconnaissance for low-privilege contexts, in a single PowerShell pass with no external binary.
 
-Lockdown-NG enumerates directories a low-priv user can **write to and execute from**, cross-references them against the effective AppLocker policy, and reports whether a bypass is even required. It is an enumeration and validation tool, **not a novel bypass**. The writable locations it finds under `%WINDIR%` and `%PROGRAMFILES%` are well documented; the value here is getting the *correctness* and the *correlation* right, in one artifact that runs in a constrained shell.
+Lockdown enumerates directories a low-priv user can **write to and execute from**, cross-references them against the effective AppLocker policy, and reports whether a bypass is even required. It is an enumeration and validation tool, **not a novel bypass**. The writable locations it finds under `%WINDIR%` and `%PROGRAMFILES%` are well documented; the value here is getting the *correctness* and the *correlation* right, in one artifact that runs in a constrained shell.
 
 Part of the Decepticons offensive tooling suite.
 
