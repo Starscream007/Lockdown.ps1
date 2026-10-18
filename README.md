@@ -111,6 +111,7 @@ Enforcement mode:
 ## Limitations
 
 - Enumeration only. It finds and validates locations; it does not execute anything.
+- Enumeration works by **reading DACLs**. A directory where you have Write+Execute but not `READ_CONTROL` (you cannot read its security descriptor) is invisible to the tool - even though it may be a perfectly usable drop location, since write and execute do not require reading the DACL. Running elevated reads every DACL; as a plain low-priv user you only see the locations whose ACLs you are allowed to read.
 - Covers AppLocker path rules. Publisher and Hash rules are not parsed - a binary allowed by a Publisher rule may be reported as `not in allow`.
 - Default-rule writable directories under `%WINDIR%` are well-known; this tool confirms which ones *your* current context can actually use, it does not claim to discover new ones.
 - Path construction trusts the `%WINDIR%` / `%PROGRAMFILES%` environment variables. On a host where those are poisoned (user-scope override), the scan targets will be wrong - resolve them from `HKLM\...\CurrentVersion\SystemRoot` if that is a concern.
