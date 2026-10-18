@@ -14,8 +14,8 @@ In one run:
 
 - **Effective Write+Execute ACL scan** per directory, resolved against the current user's group memberships (or a simulated principal).
 - **AppLocker path correlation** - each writable+executable directory is tagged against the policy's Allow and Deny path rules.
-- **Enforcement mode per rule collection** (Exe / Dll / Script / Msi / Appx) - tells you which bypass classes are actually enforced.
-- **Bypass Candidates** - a deduplicated summary of directories that are writable, executable, and reachable under an Allow path (Deny paths excluded).
+- **Enforcement mode per rule collection** (Exe / Dll / Script / Msi / Appx) - tells you which bypass classes are actually enforced, and the rest of the output respects it (see below).
+- **Bypass Candidates** - a deduplicated summary of directories usable for execution in the current context.
 - **LOLBAS availability** against the policy (`installutil`, `rundll32`, `regsvr32`, `mshta`, `wscript`, `cscript`, `msbuild`, `certutil`, `winget`).
 - **PowerShell Language Mode** (Full / Constrained / Restricted / NoLanguage).
 - **PowerShell v2** availability (registry + feature + .NET 3.5, three-state).
@@ -39,6 +39,9 @@ Effective access per right follows the Windows order: explicit Deny > explicit A
 **Deny path rules respected.**
 AppLocker path precedence is Deny over Allow. A writable directory under an Allow path but also under a Deny path is **not** a candidate and is tagged `[AL:Deny-override]`.
 
+**Enforcement mode drives the verdict.**
+AppLocker only blocks execution when the relevant rule collection is `Enabled`. If the Exe collection is `NotConfigured` or `AuditOnly`, binaries run regardless of the rules - so allow-path membership becomes irrelevant. In that case every writable+executable directory is a usable drop-and-run location (tagged `[AL:not enforced]`) and LOLBAS binaries are reported as runnable, instead of being misreported as blocked. The tool does not assume enforcement; it reads it and applies it everywhere.
+
 **No external binary.**
 Everything is native PowerShell. Nothing to drop on the target (which may itself be AppLocker-blocked or flagged), and it runs in a Constrained Language Mode shell.
 
@@ -48,25 +51,25 @@ Everything is native PowerShell. Nothing to drop on the target (which may itself
 
 ```powershell
 # scan %WINDIR% (default)
-./Lockdown-NG.ps1
+./Lockdown.ps1
 
 # scan all default high-value targets
-./Lockdown-NG.ps1 -AllTargets
+./Lockdown.ps1 -AllTargets
 
 # specific targets
-./Lockdown-NG.ps1 -Target "C:\Windows","C:\ProgramData"
+./Lockdown.ps1 -Target "C:\Windows","C:\ProgramData"
 
 # export results to a file
-./Lockdown-NG.ps1 -AllTargets -Output C:\results.txt
+./Lockdown.ps1 -AllTargets -Output C:\results.txt
 
 # simulate another principal (LDAP resolution of its groups)
-./Lockdown-NG.ps1 -AsUser "DOMAIN\john"
+./Lockdown.ps1 -AsUser "DOMAIN\john"
 
 # simulate with manually supplied groups (no LDAP)
-./Lockdown-NG.ps1 -AsUser "DOMAIN\john" -Groups "DOMAIN\IT Staff","BUILTIN\Users"
+./Lockdown.ps1 -AsUser "DOMAIN\john" -Groups "DOMAIN\IT Staff","BUILTIN\Users"
 
 # local account
-./Lockdown-NG.ps1 -AsUser "MACHINE\localjohn"
+./Lockdown.ps1 -AsUser "MACHINE\localjohn"
 ```
 
 | Parameter     | Description                                                            |
@@ -81,16 +84,19 @@ Everything is native PowerShell. Nothing to drop on the target (which may itself
 
 ## Reading the output
 
+Per-directory AppLocker tag:
+
 | Tag                  | Meaning                                                        |
 |----------------------|----------------------------------------------------------------|
-| `[AL:Allow]`         | Directory sits under an AppLocker Allow path.                  |
+| `[AL:Allow]`         | Enforced, and the directory sits under an Allow path.         |
 | `[AL:Deny-override]` | Under an Allow path but also a Deny path - Deny wins, not usable. |
-| `[AL:not in allow]`  | Writable+executable but outside any Allow path.               |
+| `[AL:not in allow]`  | Enforced, writable+executable, but outside any Allow path.    |
+| `[AL:not enforced]`  | The Exe collection is not Enabled - execution is not gated, the directory is usable regardless of rules. |
 | `[explicit]` / `[inherited]` | Whether the granting ACE is explicit on the directory or inherited. |
 
 Enforcement mode:
 - `Enabled` - the collection is enforced; you need a bypass for that class.
-- `AuditOnly` / `NotConfigured` - the class runs; logged only or not checked at all.
+- `AuditOnly` / `NotConfigured` - the class runs; logged only, or not checked at all.
 
 ---
 
@@ -107,6 +113,7 @@ Enforcement mode:
 - Enumeration only. It finds and validates locations; it does not execute anything.
 - Covers AppLocker path rules. Publisher and Hash rules are not parsed - a binary allowed by a Publisher rule may be reported as `not in allow`.
 - Default-rule writable directories under `%WINDIR%` are well-known; this tool confirms which ones *your* current context can actually use, it does not claim to discover new ones.
+- Path construction trusts the `%WINDIR%` / `%PROGRAMFILES%` environment variables. On a host where those are poisoned (user-scope override), the scan targets will be wrong - resolve them from `HKLM\...\CurrentVersion\SystemRoot` if that is a concern.
 - `-AsUser` LDAP resolution requires reachability of the domain from the host.
 
 ---
