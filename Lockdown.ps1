@@ -22,8 +22,11 @@
 #       matching the NetBIOS form stored in ACEs
 #     - AppLocker : %PROGRAMFILES% expanded (+x86), separator-boundary
 #       path match, Allow AND Deny path rules parsed (Deny precedence)
+#     - EnforcementMode-aware : when a collection is not Enabled, execution
+#       is not actually gated -> LOLBAS and candidates reflect that instead
+#       of reporting everything as blocked / not-in-allow
 #     - RuleCollection EnforcementMode report (Exe/Dll/Script/Msi/Appx)
-#     - Bypass Candidates summary (Write+Execute under an Allow path)
+#     - Bypass Candidates summary (Write+Execute, usable in context)
 #     - Perf : HashSet group lookup, GetAccessControl(), -Force
 #
 #   Usage :
@@ -60,7 +63,7 @@ else              { $scanPaths = @($env:windir) }
 
 $count = 0
 
-# Collected bypass candidates (Write+Execute AND inside an AppLocker allow path)
+# Collected bypass candidates (Write+Execute dirs usable for execution in context)
 $bypassCandidates = [System.Collections.Generic.List[string]]::new()
 
 # ------------------------------------------------------------
@@ -112,7 +115,7 @@ Write-Host "  | |__| |_| | |___| . \| |_| | |_| | \ V  V / | |\  |" -ForegroundC
 Write-Host "  |_____\___/ \____|_|\_\____/ \___/   \_/\_/  |_| \_|" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "        by Starscream  |  Decepticons Suite"            -ForegroundColor Magenta
-Write-Host "               Peace through tyranny.."                 -ForegroundColor Magenta
+Write-Host "               Peace through tyranny."                  -ForegroundColor Magenta
 Write-Host "  ====================================================" -ForegroundColor DarkCyan
 Write-Host ""
 
@@ -304,6 +307,12 @@ function Get-AppLockerMatch {
 function Get-AppLockerBinaryStatus {
     param([string]$binPath)
     if (-not $hasAppLocker) { return "unknown" }
+    # A LOLBAS is an .exe -> governed by the Exe collection. If Exe is not
+    # Enabled (NotConfigured / AuditOnly), execution is not blocked, whatever
+    # the rules say. Reporting it as denied would be a false negative.
+    if (-not ($enforcementModes.ContainsKey("Exe") -and $enforcementModes["Exe"] -eq "Enabled")) {
+        return "notenforced"
+    }
     try {
         $result = Test-AppLockerPolicy -PolicyObject $appLockerPolicy -Path $binPath -ErrorAction Stop
         if ($result.PolicyDecision -eq "Allowed") { return "allowed" }
@@ -333,7 +342,7 @@ Write-Host "   AppLocker  : $alInfo"      -ForegroundColor $alColor
 Write-Host "  ============================================="        -ForegroundColor DarkCyan
 
 if ($Output) {
-    "Lockdown-NG.ps1 | $(Get-Date -Format 'yyyy-MM-dd HH:mm')" | Out-File $Output
+    "Lockdown.ps1 | $(Get-Date -Format 'yyyy-MM-dd HH:mm')" | Out-File $Output
     "User      : $userLabel"    | Add-Content $Output
     "Groups    : $groupSource"  | Add-Content $Output
     $currentGroups | ForEach-Object { "    $_" | Add-Content $Output }
@@ -393,6 +402,13 @@ if (-not $hasAppLocker) {
     }
 }
 
+# Is EXE execution actually gated ? Only when the Exe collection is Enabled.
+# No policy, or Exe NotConfigured/AuditOnly -> execution runs anywhere, so
+# allow-path membership is irrelevant for candidate selection and tagging.
+$exeEnforced = $hasAppLocker -and
+               $enforcementModes.ContainsKey("Exe") -and
+               ($enforcementModes["Exe"] -eq "Enabled")
+
 # ------------------------------------------------------------
 #   ACL Scan (effective Write+Execute per directory)
 # ------------------------------------------------------------
@@ -448,15 +464,21 @@ foreach ($scanPath in $scanPaths) {
 
                 $alMatch     = Get-AppLockerMatch $dir.FullName
                 $isAllowPath = ($null -ne $alMatch) -and ($alMatch -ne $false) -and ($alMatch -ne "deny")
-                if     ($null -eq $alMatch)     { $alTag = "";                   $alTagColor = "DarkGray" }
-                elseif ($alMatch -eq "deny")    { $alTag = "[AL:Deny-override]"; $alTagColor = "Red" }
-                elseif ($alMatch -eq $false)    { $alTag = "[AL:not in allow]";  $alTagColor = "Red" }
-                else                            { $alTag = "[AL:Allow]";         $alTagColor = "Green" }
 
-                # Bypass candidate : writable+executable AND reachable under
-                # an AppLocker allow path, Deny paths excluded (Deny overrides
-                # Allow). AL policy unreadable -> flag all (status unconfirmed).
-                if ($isAllowPath -or (-not $hasAppLocker)) {
+                if (-not $exeEnforced) {
+                    # Execution not gated -> any W+X dir is a usable drop-and-run spot,
+                    # allow-path membership is moot.
+                    $alTag = "[AL:not enforced]"; $alTagColor = "Green"
+                }
+                elseif ($null -eq $alMatch)  { $alTag = "";                   $alTagColor = "DarkGray" }
+                elseif ($alMatch -eq "deny") { $alTag = "[AL:Deny-override]"; $alTagColor = "Red" }
+                elseif ($alMatch -eq $false) { $alTag = "[AL:not in allow]";  $alTagColor = "Red" }
+                else                         { $alTag = "[AL:Allow]";         $alTagColor = "Green" }
+
+                # Bypass candidate = usable execution location :
+                #   - execution not enforced -> any W+X dir works
+                #   - enforced -> only under an Allow path, Deny excluded
+                if ((-not $exeEnforced) -or $isAllowPath) {
                     [void]$bypassCandidates.Add($dir.FullName)
                 }
 
@@ -550,6 +572,10 @@ foreach ($bin in $lolbas) {
         "allowed" {
             Write-Host "    [+] $bin : available [AL:Allow]" -ForegroundColor Green
             if ($Output) { "    [+] $bin : available [AL:Allow]" | Add-Content $Output }
+        }
+        "notenforced" {
+            Write-Host "    [+] $bin : available [AL:not enforced]" -ForegroundColor Green
+            if ($Output) { "    [+] $bin : available [AL:not enforced]" | Add-Content $Output }
         }
         "denied"  {
             Write-Host "    [-] $bin : blocked [AL:Deny]"    -ForegroundColor Red
@@ -723,8 +749,8 @@ if ($Output) {
 $uniqueCandidates = $bypassCandidates | Select-Object -Unique
 
 if ($uniqueCandidates.Count -eq 0) {
-    Write-Host "    [-] none : no Write+Execute dir inside an allow path" -ForegroundColor DarkGray
-    if ($Output) { "    [-] none : no Write+Execute dir inside an allow path" | Add-Content $Output }
+    Write-Host "    [-] none : no usable Write+Execute location found" -ForegroundColor DarkGray
+    if ($Output) { "    [-] none : no usable Write+Execute location found" | Add-Content $Output }
 } else {
     if (-not $hasAppLocker) {
         Write-Host "    [!] AppLocker policy unreadable - listing all W+X dirs (allow-path status unconfirmed)" -ForegroundColor Yellow
