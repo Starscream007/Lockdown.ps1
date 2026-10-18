@@ -1,5 +1,5 @@
 # ============================================================
-#   Lockdown.ps1
+#   Lockdown-NG.ps1
 #   Author  : Starscream
 #   Purpose : Detection of directories with Write+Execute ACL
 #             accessible to low-priv users (AppLocker bypass)
@@ -8,15 +8,43 @@
 #             + PS v2 availability check
 #             + user context simulation (domain or local)
 #
+#   NG changes vs Lockdown.ps1 :
+#     - Generic access rights (GenericAll/Write/Execute) now resolved
+#       -> fixes false negatives on ACE carrying generic masks
+#     - Write/Execute detection via bitwise flags, not string match
+#       -> WriteData (file drop) and ExecuteFile tested explicitly
+#       -> CreateDirectories and Modify-without-execute no longer
+#          counted as write/execute (false positives removed)
+#     - Effective access per directory : canonical Windows evaluation
+#       order (explicit Deny > explicit Allow > inherited Deny >
+#       inherited Allow), evaluated per right
+#       -> catches rights split across multiple ACE
+#     - Perf : group lookup via HashSet, GetAccessControl() over Get-Acl,
+#       hidden/system dirs included (-Force)
+#
+#   NG+ changes (this revision) :
+#     - FIX effective access : explicit Allow now beats inherited Deny
+#       (was: any applicable Deny blocked -> false negatives)
+#     - FIX LDAP group identities resolved via SID->NTAccount
+#       (was: FQDN prefix -> never matched NetBIOS ACE identities)
+#     - FIX local-account groups resolved via SID->NTAccount
+#       (was: hardcoded BUILTIN\ prefix -> custom/machine groups missed)
+#     - FIX AppLocker path vars : %PROGRAMFILES% now expanded (+x86)
+#     - FIX AppLocker path match : separator-boundary compare
+#       (was: C:\Windows matched C:\WindowsApps ; wildcard metachar unescaped)
+#     - ADD RuleCollection EnforcementMode report (Exe/Dll/Script/Msi/Appx)
+#       -> shows which bypass classes are even enforced
+#     - ADD Bypass Candidates summary (Write+Execute AND under AL allow path)
+#
 #   Usage   :
-#     ./Lockdown.ps1
-#     ./Lockdown.ps1 -AllTargets
-#     ./Lockdown.ps1 -Target "C:\Windows","C:\ProgramData"
-#     ./Lockdown.ps1 -AllTargets -Output C:\results.txt
-#     ./Lockdown.ps1 -AsUser "DOMAIN\john"
-#     ./Lockdown.ps1 -AsUser "DOMAIN\john" -Groups "DOMAIN\IT Staff","BUILTIN\Users"
-#     ./Lockdown.ps1 -AsUser "localjohn"
-#     ./Lockdown.ps1 -AsUser "MACHINE\localjohn"
+#     ./Lockdown-NG.ps1
+#     ./Lockdown-NG.ps1 -AllTargets
+#     ./Lockdown-NG.ps1 -Target "C:\Windows","C:\ProgramData"
+#     ./Lockdown-NG.ps1 -AllTargets -Output C:\results.txt
+#     ./Lockdown-NG.ps1 -AsUser "DOMAIN\john"
+#     ./Lockdown-NG.ps1 -AsUser "DOMAIN\john" -Groups "DOMAIN\IT Staff","BUILTIN\Users"
+#     ./Lockdown-NG.ps1 -AsUser "localjohn"
+#     ./Lockdown-NG.ps1 -AsUser "MACHINE\localjohn"
 # ============================================================
 
 [CmdletBinding()]
@@ -43,6 +71,48 @@ else              { $scanPaths = @($env:windir) }
 
 $count = 0
 
+# Collected bypass candidates (Write+Execute AND inside an AppLocker allow path)
+$bypassCandidates = [System.Collections.Generic.List[string]]::new()
+
+# ------------------------------------------------------------
+#   Access-mask flags (NTFS FileSystemRights + generic bits)
+# ------------------------------------------------------------
+# Specific file rights
+$FR_WriteData    = 0x00000002   # CreateFiles  -> drop a file (needed)
+$FR_ExecuteFile  = 0x00000020   # Traverse/Execute
+# AppendData (0x4 = CreateDirectories) intentionally NOT treated as write:
+# it allows creating subdirs, not dropping a file.
+# Generic access bits (never expanded by the .NET FileSystemRights enum)
+$GEN_ALL         = 0x10000000
+$GEN_EXECUTE     = 0x20000000
+$GEN_WRITE       = 0x40000000
+
+# Returns @{ Write = [bool]; Execute = [bool] } for a given FileSystemRights value.
+# Resolves generic masks to the specific capabilities relevant here.
+function Get-WXFlags {
+    param($FileSystemRights)
+    $r = [int]$FileSystemRights
+    $w = ( ($r -band $FR_WriteData)   -ne 0 ) -or
+         ( ($r -band $GEN_WRITE)      -ne 0 ) -or
+         ( ($r -band $GEN_ALL)        -ne 0 )
+    $e = ( ($r -band $FR_ExecuteFile) -ne 0 ) -or
+         ( ($r -band $GEN_EXECUTE)    -ne 0 ) -or
+         ( ($r -band $GEN_ALL)        -ne 0 )
+    return @{ Write = $w; Execute = $e }
+}
+
+# Canonical Windows ACL evaluation for a single right.
+# Order : explicit Deny > explicit Allow > inherited Deny > inherited Allow.
+# -> explicit Allow correctly overrides an inherited Deny (false-negative fix).
+function Resolve-EffectiveRight {
+    param([bool]$ExAllow, [bool]$ExDeny, [bool]$InAllow, [bool]$InDeny)
+    if ($ExDeny)  { return $false }
+    if ($ExAllow) { return $true  }
+    if ($InDeny)  { return $false }
+    if ($InAllow) { return $true  }
+    return $false
+}
+
 # Banner
 Write-Host ""
 Write-Host "  ====================================================" -ForegroundColor DarkCyan
@@ -52,10 +122,20 @@ Write-Host "  | |  | | | | |   | ' /| | | | | | |\ \ /\ / /|  \| |" -ForegroundC
 Write-Host "  | |__| |_| | |___| . \| |_| | |_| | \ V  V / | |\  |" -ForegroundColor Cyan
 Write-Host "  |_____\___/ \____|_|\_\____/ \___/   \_/\_/  |_| \_|" -ForegroundColor Cyan
 Write-Host ""
-Write-Host "          by Starscream  |  Decepticons Suite"          -ForegroundColor Magenta
+Write-Host "        by Starscream  |  Decepticons Suite  [NG]"      -ForegroundColor Magenta
 Write-Host "               Peace through tyranny."                  -ForegroundColor Magenta
 Write-Host "  ====================================================" -ForegroundColor DarkCyan
 Write-Host ""
+
+# Resolve a security principal (group) to the NTAccount string that ACE
+# IdentityReference.Value uses (NetBIOS form). Returns $null on failure.
+function Resolve-SidToNTAccount {
+    param($Sid)
+    try {
+        return ([System.Security.Principal.SecurityIdentifier]$Sid).Translate(
+                [System.Security.Principal.NTAccount]).Value
+    } catch { return $null }
+}
 
 # User and group resolution
 function Get-LdapGroups {
@@ -67,10 +147,17 @@ function Get-LdapGroups {
         $ctx      = [System.DirectoryServices.AccountManagement.ContextType]::Domain
         $userPrin = [System.DirectoryServices.AccountManagement.UserPrincipal]::FindByIdentity($ctx, $username)
         if ($userPrin) {
-            $domain = $userPrin.Context.Name
-            return $userPrin.GetAuthorizationGroups() |
-                   ForEach-Object { "$domain\$($_.SamAccountName)" } |
-                   Where-Object { $_ }
+            $resolved = @()
+            foreach ($g in $userPrin.GetAuthorizationGroups()) {
+                try {
+                    # SID -> NTAccount gives the NetBIOS form stored in ACEs,
+                    # unlike Context.Name which is often the FQDN.
+                    $nt = Resolve-SidToNTAccount $g.Sid
+                    if ($nt) { $resolved += $nt }
+                    elseif ($g.SamAccountName) { $resolved += $g.SamAccountName }
+                } catch { }
+            }
+            if ($resolved.Count -gt 0) { return $resolved }
         }
     } catch { }
 
@@ -81,8 +168,19 @@ function Get-LdapGroups {
         $user      = [ADSI]"WinNT://$computer/$localUser,user"
         $groups    = @()
         $user.Groups() | ForEach-Object {
-            $grp  = [ADSI]$_.GetType().InvokeMember("AdsPath", 'GetProperty', $null, $_, $null)
-            $groups += "BUILTIN\$($grp.Name[0])"
+            $grp = [ADSI]$_.GetType().InvokeMember("AdsPath", 'GetProperty', $null, $_, $null)
+            $nt  = $null
+            try {
+                # Resolve the group SID to its NTAccount form (correct authority
+                # prefix: BUILTIN\, NT AUTHORITY\, or MACHINE\CustomGroup).
+                $sidBytes = $grp.InvokeGet('objectSID')
+                if ($sidBytes) {
+                    $sid = New-Object System.Security.Principal.SecurityIdentifier($sidBytes, 0)
+                    $nt  = Resolve-SidToNTAccount $sid
+                }
+            } catch { }
+            if ($nt) { $groups += $nt }
+            elseif ($grp.Name[0]) { $groups += "$($grp.Name[0])" }  # bare name fallback
         }
         if ($groups.Count -gt 0) { return $groups }
     } catch { }
@@ -120,33 +218,95 @@ if ($AsUser) {
                      Select-Object -ExpandProperty "Group Name"
 }
 
-# AppLocker policy (best-effort)
+# Fast membership lookup (O(1) vs -contains O(n) per ACE)
+$groupSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+foreach ($g in $currentGroups) { if ($g) { [void]$groupSet.Add($g) } }
+[void]$groupSet.Add("NT AUTHORITY\Authenticated Users")
+[void]$groupSet.Add("BUILTIN\Users")
+
+# ------------------------------------------------------------
+#   AppLocker policy (best-effort)
+# ------------------------------------------------------------
 $appLockerAllowPaths = @()
+$appLockerDenyPaths  = @()
+$enforcementModes    = @{}   # collection type -> EnforcementMode
 $hasAppLocker        = $false
 $appLockerPolicy     = Get-AppLockerPolicy -Effective -ErrorAction SilentlyContinue
+
+# Normalize an AppLocker FilePathCondition into concrete literal path prefixes.
+# %PROGRAMFILES% yields two variants (native + x86); other vars expanded inline.
+function Resolve-RulePaths {
+    param([string]$raw)
+    if (-not $raw) { return @() }
+    $variants = @()
+    if ($raw -match '%PROGRAMFILES%') {
+        $pf   = $env:ProgramFiles
+        $pf86 = ${env:ProgramFiles(x86)}
+        if ($pf)   { $variants += ($raw -replace '%PROGRAMFILES%', $pf)   }
+        if ($pf86) { $variants += ($raw -replace '%PROGRAMFILES%', $pf86) }
+    } else {
+        $variants += $raw
+    }
+    $out = @()
+    foreach ($v in $variants) {
+        $p = $v `
+            -replace '%WINDIR%',   $env:windir `
+            -replace '%SYSTEM32%', "$env:windir\System32" `
+            -replace '%OSDRIVE%',  $env:SystemDrive `
+            -replace '\\\*$',      '' `
+            -replace '\*$',        ''
+        if ($p) { $out += $p.TrimEnd('\') }
+    }
+    return $out
+}
 
 try {
     $xml = [xml](Get-AppLockerPolicy -Effective -Xml -ErrorAction Stop)
     $xml.AppLockerPolicy.RuleCollection | ForEach-Object {
-        $_.FilePathRule | Where-Object { $_.Action -eq "Allow" } | ForEach-Object {
-            $p = $_.Conditions.FilePathCondition.Path `
-                -replace '%WINDIR%',   $env:windir `
-                -replace '%SYSTEM32%', "$env:windir\System32" `
-                -replace '%OSDRIVE%',  $env:SystemDrive `
-                -replace '\\\*$',      '' `
-                -replace '\*$',        ''
-            if ($p) { $appLockerAllowPaths += $p.TrimEnd('\') }
+        $collType = $_.Type
+        $mode     = $_.EnforcementMode
+        if (-not $mode) { $mode = "NotConfigured" }
+        if ($collType) { $enforcementModes[$collType] = $mode }
+
+        $_.FilePathRule | ForEach-Object {
+            $paths = Resolve-RulePaths $_.Conditions.FilePathCondition.Path
+            if     ($_.Action -eq "Allow") { $appLockerAllowPaths += $paths }
+            elseif ($_.Action -eq "Deny")  { $appLockerDenyPaths  += $paths }
         }
     }
+    $appLockerAllowPaths = $appLockerAllowPaths | Select-Object -Unique
+    $appLockerDenyPaths  = $appLockerDenyPaths  | Select-Object -Unique
     $hasAppLocker = $true
 } catch { }
 
-# AppLocker dir helper
+# Separator-boundary test : is dirPath one of the prefixes, or strictly beneath
+# one (prefix + '\') ? Avoids C:\Windows matching C:\WindowsApps, and avoids
+# -like metacharacter issues.
+function Test-PathUnderAny {
+    param([string]$dirPath, $prefixes)
+    foreach ($p in $prefixes) {
+        if ($dirPath.Equals($p, [System.StringComparison]::OrdinalIgnoreCase) -or
+            $dirPath.StartsWith($p + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+        }
+    }
+    return $false
+}
+
+# AppLocker dir helper.
+# Returns : $null  -> no policy
+#           "deny" -> under a Deny path (Deny overrides Allow -> NOT a bypass)
+#           $false -> not in any allow path
+#           <path> -> matching allow path (and not denied)
 function Get-AppLockerMatch {
     param([string]$dirPath)
     if (-not $hasAppLocker) { return $null }
+    if (Test-PathUnderAny $dirPath $appLockerDenyPaths) { return "deny" }
     foreach ($p in $appLockerAllowPaths) {
-        if ($dirPath -like "$p*" -or $dirPath -eq $p) { return $p }
+        if ($dirPath.Equals($p, [System.StringComparison]::OrdinalIgnoreCase) -or
+            $dirPath.StartsWith($p + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $p
+        }
     }
     return $false
 }
@@ -160,9 +320,8 @@ function Get-AppLockerBinaryStatus {
         if ($result.PolicyDecision -eq "Allowed") { return "allowed" }
         else                                       { return "denied"  }
     } catch {
-        foreach ($p in $appLockerAllowPaths) {
-            if ($binPath -like "$p*") { return "allowed" }
-        }
+        if (Test-PathUnderAny $binPath $appLockerDenyPaths) { return "denied" }
+        if (Test-PathUnderAny $binPath $appLockerAllowPaths) { return "allowed" }
         return "unknown"
     }
 }
@@ -180,11 +339,12 @@ Write-Host "   Groups     : $groupSource" -ForegroundColor Cyan
 $currentGroups | ForEach-Object {
     Write-Host "               $_"         -ForegroundColor Yellow
 }
+Write-Host ""
 Write-Host "   AppLocker  : $alInfo"      -ForegroundColor $alColor
 Write-Host "  ============================================="        -ForegroundColor DarkCyan
 
 if ($Output) {
-    "Lockdown.ps1 | $(Get-Date -Format 'yyyy-MM-dd HH:mm')" | Out-File $Output
+    "Lockdown-NG.ps1 | $(Get-Date -Format 'yyyy-MM-dd HH:mm')" | Out-File $Output
     "User      : $userLabel"    | Add-Content $Output
     "Groups    : $groupSource"  | Add-Content $Output
     $currentGroups | ForEach-Object { "    $_" | Add-Content $Output }
@@ -192,59 +352,151 @@ if ($Output) {
     ""                          | Add-Content $Output
 }
 
-# ACL Scan
+# ------------------------------------------------------------
+#   AppLocker Enforcement Mode (per RuleCollection)
+# ------------------------------------------------------------
+Write-Host ""
+Write-Host "  =============================================" -ForegroundColor DarkCyan
+Write-Host "   AppLocker Enforcement Mode"                  -ForegroundColor Cyan
+Write-Host "  =============================================" -ForegroundColor DarkCyan
+Write-Host ""
+
+if ($Output) {
+    ""                            | Add-Content $Output
+    "AppLocker Enforcement Mode"  | Add-Content $Output
+    ""                            | Add-Content $Output
+}
+
+if (-not $hasAppLocker) {
+    Write-Host "    [?] policy not accessible - enforcement unknown" -ForegroundColor DarkGray
+    if ($Output) { "    [?] policy not accessible - enforcement unknown" | Add-Content $Output }
+} else {
+    $collOrder = @("Exe", "Dll", "Script", "Msi", "Appx")
+    foreach ($ct in $collOrder) {
+        if (-not $enforcementModes.ContainsKey($ct)) {
+            Write-Host "    [-] $ct : NotConfigured [not restricted]" -ForegroundColor DarkGray
+            if ($Output) { "    [-] $ct : NotConfigured [not restricted]" | Add-Content $Output }
+            continue
+        }
+        $m = $enforcementModes[$ct]
+        switch ($m) {
+            "Enabled" {
+                Write-Host "    [!] $ct : Enabled [enforced]" -ForegroundColor Red
+                if ($Output) { "    [!] $ct : Enabled [enforced]" | Add-Content $Output }
+            }
+            "AuditOnly" {
+                Write-Host "    [+] $ct : AuditOnly [runs, logged only - no bypass needed]" -ForegroundColor Green
+                if ($Output) { "    [+] $ct : AuditOnly [runs, logged only - no bypass needed]" | Add-Content $Output }
+            }
+            default {
+                Write-Host "    [+] $ct : $m [not restricted]" -ForegroundColor Green
+                if ($Output) { "    [+] $ct : $m [not restricted]" | Add-Content $Output }
+            }
+        }
+    }
+    # Any collection type present in the policy but outside the known list
+    foreach ($ct in $enforcementModes.Keys) {
+        if ($collOrder -notcontains $ct) {
+            $m = $enforcementModes[$ct]
+            Write-Host "    [?] $ct : $m" -ForegroundColor Yellow
+            if ($Output) { "    [?] $ct : $m" | Add-Content $Output }
+        }
+    }
+}
+
+# ------------------------------------------------------------
+#   ACL Scan (effective Write+Execute per directory)
+# ------------------------------------------------------------
 foreach ($scanPath in $scanPaths) {
     Write-Host ""
     Write-Host "  [*] Analyzing $scanPath" -ForegroundColor Cyan
     Write-Host ""
 
-    Get-ChildItem $scanPath -Directory -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
-        $dir = $_
+    $dirs = Get-ChildItem -LiteralPath $scanPath -Directory -Recurse -Force -ErrorAction SilentlyContinue
+
+    foreach ($dir in $dirs) {
         try {
-            (Get-Acl $dir.FullName).Access | ForEach-Object {
-                if ($_.AccessControlType -eq "Allow") {
-                    $id = $_.IdentityReference.Value
-                    if ($currentGroups -contains $id -or
-                        $id -eq "NT AUTHORITY\Authenticated Users" -or
-                        $id -eq "BUILTIN\Users") {
+            # Faster than Get-Acl; fall back for PS7 where the method is gone
+            $acl = try { $dir.GetAccessControl() } catch { Get-Acl -LiteralPath $dir.FullName }
 
-                        $r          = $_.FileSystemRights.ToString()
-                        $hasWrite   = $r -match "Write|Create|FullControl|Modify"
-                        $hasExecute = $r -match "Execute|FullControl|Modify"
+            # Four buckets per right : explicit/inherited x Allow/Deny
+            $exAllowW = $false; $exAllowE = $false
+            $exDenyW  = $false; $exDenyE  = $false
+            $inAllowW = $false; $inAllowE = $false
+            $inDenyW  = $false; $inDenyE  = $false
+            $anyExplicit  = $false
+            $contributors = [System.Collections.Generic.List[string]]::new()
 
-                        if ($hasWrite -and $hasExecute) {
+            foreach ($ace in $acl.Access) {
+                $id = $ace.IdentityReference.Value
+                if (-not $groupSet.Contains($id)) { continue }
 
-                            $aclTag   = if ($_.IsInherited) { "[inherited]" } else { "[explicit]" }
-                            $aclColor = if ($_.IsInherited) { "DarkGray" }    else { "Green" }
+                $wx        = Get-WXFlags $ace.FileSystemRights
+                $inherited = $ace.IsInherited
 
-                            $alMatch    = Get-AppLockerMatch $dir.FullName
-                            $alTag      = if ($null -ne $alMatch -and $alMatch -ne $false) { "[AL:Allow]" } `
-                                          elseif ($alMatch -eq $false)                     { "[AL:not in allow]" } `
-                                          else                                              { "" }
-                            $alTagColor = if ($alMatch) { "Green" } else { "Red" }
-
-                            $count++
-                            $mainColor = if (-not $_.IsInherited) { "Green" } else { "Yellow" }
-
-                            Write-Host "[+] $($dir.FullName)" -ForegroundColor $mainColor
-                            Write-Host "    Identity : $id"   -ForegroundColor Cyan
-                            Write-Host "    Rights   : $r"    -ForegroundColor Yellow
-                            Write-Host "    ACL      : $aclTag" -ForegroundColor $aclColor
-                            if ($alTag) {
-                                Write-Host "    AppLocker: $alTag" -ForegroundColor $alTagColor
-                            }
-                            Write-Host ""
-
-                            if ($Output) {
-                                "[+] $($dir.FullName)"    | Add-Content $Output
-                                "    Identity : $id"      | Add-Content $Output
-                                "    Rights   : $r"       | Add-Content $Output
-                                "    ACL      : $aclTag"  | Add-Content $Output
-                                if ($alTag) { "    AppLocker: $alTag" | Add-Content $Output }
-                                ""                        | Add-Content $Output
-                            }
-                        }
+                if ($ace.AccessControlType -eq 'Allow') {
+                    if ($wx.Write)   { if ($inherited) { $inAllowW = $true } else { $exAllowW = $true } }
+                    if ($wx.Execute) { if ($inherited) { $inAllowE = $true } else { $exAllowE = $true } }
+                    if ($wx.Write -or $wx.Execute) {
+                        $contributors.Add("$id ($($ace.FileSystemRights))")
+                        if (-not $inherited) { $anyExplicit = $true }
                     }
+                } else {   # Deny
+                    if ($wx.Write)   { if ($inherited) { $inDenyW = $true } else { $exDenyW = $true } }
+                    if ($wx.Execute) { if ($inherited) { $inDenyE = $true } else { $exDenyE = $true } }
+                }
+            }
+
+            # Effective access : canonical evaluation order, per right
+            $effW = Resolve-EffectiveRight $exAllowW $exDenyW $inAllowW $inDenyW
+            $effE = Resolve-EffectiveRight $exAllowE $exDenyE $inAllowE $inDenyE
+
+            if ($effW -and $effE) {
+
+                $aclTag   = if ($anyExplicit) { "[explicit]" } else { "[inherited]" }
+                $aclColor = if ($anyExplicit) { "Green" }      else { "DarkGray" }
+                $mainColor= if ($anyExplicit) { "Green" }      else { "Yellow" }
+
+                $alMatch     = Get-AppLockerMatch $dir.FullName
+                $isAllowPath = ($null -ne $alMatch) -and ($alMatch -ne $false) -and ($alMatch -ne "deny")
+                if     ($null -eq $alMatch)     { $alTag = "";                   $alTagColor = "DarkGray" }
+                elseif ($alMatch -eq "deny")    { $alTag = "[AL:Deny-override]"; $alTagColor = "Red" }
+                elseif ($alMatch -eq $false)    { $alTag = "[AL:not in allow]";  $alTagColor = "Red" }
+                else                            { $alTag = "[AL:Allow]";         $alTagColor = "Green" }
+
+                # Bypass candidate : writable+executable AND reachable under
+                # an AppLocker allow path, Deny paths excluded (Deny overrides
+                # Allow). AL policy unreadable -> flag all (status unconfirmed).
+                if ($isAllowPath -or (-not $hasAppLocker)) {
+                    [void]$bypassCandidates.Add($dir.FullName)
+                }
+
+                $count++
+
+                Write-Host "[+] $($dir.FullName)" -ForegroundColor $mainColor
+                $first = $true
+                foreach ($c in $contributors) {
+                    if ($first) { Write-Host "    Identity : $c" -ForegroundColor Cyan; $first = $false }
+                    else        { Write-Host "               $c" -ForegroundColor Cyan }
+                }
+                Write-Host "    Access   : Write+Execute [effective]" -ForegroundColor Yellow
+                Write-Host "    ACL      : $aclTag"                   -ForegroundColor $aclColor
+                if ($alTag) {
+                    Write-Host "    AppLocker: $alTag" -ForegroundColor $alTagColor
+                }
+                Write-Host ""
+
+                if ($Output) {
+                    "[+] $($dir.FullName)" | Add-Content $Output
+                    $first = $true
+                    foreach ($c in $contributors) {
+                        if ($first) { "    Identity : $c" | Add-Content $Output; $first = $false }
+                        else        { "               $c" | Add-Content $Output }
+                    }
+                    "    Access   : Write+Execute [effective]" | Add-Content $Output
+                    "    ACL      : $aclTag"                   | Add-Content $Output
+                    if ($alTag) { "    AppLocker: $alTag"      | Add-Content $Output }
+                    ""                                         | Add-Content $Output
                 }
             }
         } catch {
@@ -447,10 +699,8 @@ if (-not (Test-Path $cacheDir)) {
             $acl      = Get-Acl $cfPath
             $writable = $acl.Access | Where-Object {
                 $_.AccessControlType -eq "Allow" -and
-                ($currentGroups -contains $_.IdentityReference.Value -or
-                 $_.IdentityReference.Value -eq "NT AUTHORITY\Authenticated Users" -or
-                 $_.IdentityReference.Value -eq "BUILTIN\Users") -and
-                $_.FileSystemRights -match "Write|FullControl|Modify"
+                $groupSet.Contains($_.IdentityReference.Value) -and
+                (Get-WXFlags $_.FileSystemRights).Write
             }
             if ($writable) {
                 Write-Host "    [+] $cf : writable [cache poisoning possible]" -ForegroundColor Green
@@ -466,10 +716,65 @@ if (-not (Test-Path $cacheDir)) {
     }
 }
 
+# ------------------------------------------------------------
+#   Bypass Candidates (prioritized summary)
+# ------------------------------------------------------------
+Write-Host ""
+Write-Host "  =============================================" -ForegroundColor DarkCyan
+Write-Host "   Bypass Candidates"                           -ForegroundColor Cyan
+Write-Host "  =============================================" -ForegroundColor DarkCyan
+Write-Host ""
+
+if ($Output) {
+    ""                   | Add-Content $Output
+    "Bypass Candidates"  | Add-Content $Output
+    ""                   | Add-Content $Output
+}
+
+$uniqueCandidates = $bypassCandidates | Select-Object -Unique
+
+if ($uniqueCandidates.Count -eq 0) {
+    Write-Host "    [-] none : no Write+Execute dir inside an allow path" -ForegroundColor DarkGray
+    if ($Output) { "    [-] none : no Write+Execute dir inside an allow path" | Add-Content $Output }
+} else {
+    if (-not $hasAppLocker) {
+        Write-Host "    [!] AppLocker policy unreadable - listing all W+X dirs (allow-path status unconfirmed)" -ForegroundColor Yellow
+        if ($Output) { "    [!] AppLocker policy unreadable - listing all W+X dirs (allow-path status unconfirmed)" | Add-Content $Output }
+        Write-Host ""
+    }
+    foreach ($c in $uniqueCandidates) {
+        Write-Host "    [+] $c" -ForegroundColor Green
+        if ($Output) { "    [+] $c" | Add-Content $Output }
+    }
+
+    # Cross-reference execution enforcement : if Exe/Script not enforced,
+    # a write-exec location may not even require a bypass.
+    if ($hasAppLocker) {
+        $exeMode    = if ($enforcementModes.ContainsKey("Exe"))    { $enforcementModes["Exe"] }    else { "NotConfigured" }
+        $scriptMode = if ($enforcementModes.ContainsKey("Script")) { $enforcementModes["Script"] } else { "NotConfigured" }
+        $dllMode    = if ($enforcementModes.ContainsKey("Dll"))    { $enforcementModes["Dll"] }    else { "NotConfigured" }
+
+        $notes = @()
+        if ($exeMode -ne "Enabled" -or $scriptMode -ne "Enabled") {
+            $notes += "    [i] Exe=$exeMode / Script=$scriptMode : non-enforced classes may run without a bypass"
+        }
+        if ($dllMode -ne "Enabled") {
+            $notes += "    [i] Dll=$dllMode : a DLL dropped in these dirs loads via regsvr32/rundll32 without a bypass"
+        }
+        if ($notes.Count -gt 0) {
+            Write-Host ""
+            foreach ($n in $notes) {
+                Write-Host $n -ForegroundColor DarkCyan
+                if ($Output) { $n | Add-Content $Output }
+            }
+        }
+    }
+}
+
 # Footer
 Write-Host ""
 Write-Host "  =============================================" -ForegroundColor DarkCyan
-Write-Host "   $count director(ies) found"                 -ForegroundColor Yellow
+Write-Host "   $count director(ies) found | $($uniqueCandidates.Count) bypass candidate(s)" -ForegroundColor Yellow
 if ($Output) {
     Write-Host "   Results exported : $Output"             -ForegroundColor DarkGray
 }
