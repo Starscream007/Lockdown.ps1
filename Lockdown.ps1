@@ -1,6 +1,7 @@
 # ============================================================
-#   Lockdown-NG.ps1
+#   Lockdown.ps1
 #   Author  : Starscream
+#   Version : 2.0  (rewrite of the original Lockdown)
 #   Purpose : Detection of directories with Write+Execute ACL
 #             accessible to low-priv users (AppLocker bypass)
 #             + LOLBAS check + AppLocker cache
@@ -8,43 +9,31 @@
 #             + PS v2 availability check
 #             + user context simulation (domain or local)
 #
-#   NG changes vs Lockdown.ps1 :
-#     - Generic access rights (GenericAll/Write/Execute) now resolved
+#   v2 changes :
+#     - Generic access rights (GenericAll/Write/Execute) resolved
 #       -> fixes false negatives on ACE carrying generic masks
 #     - Write/Execute detection via bitwise flags, not string match
 #       -> WriteData (file drop) and ExecuteFile tested explicitly
-#       -> CreateDirectories and Modify-without-execute no longer
-#          counted as write/execute (false positives removed)
-#     - Effective access per directory : canonical Windows evaluation
-#       order (explicit Deny > explicit Allow > inherited Deny >
-#       inherited Allow), evaluated per right
-#       -> catches rights split across multiple ACE
-#     - Perf : group lookup via HashSet, GetAccessControl() over Get-Acl,
-#       hidden/system dirs included (-Force)
+#       -> CreateDirectories / Modify-without-execute not counted
+#     - Effective access per right : canonical Windows evaluation order
+#       (explicit Deny > explicit Allow > inherited Deny > inherited Allow)
+#       -> explicit Allow correctly beats inherited Deny
+#     - Group identities resolved via SID -> NTAccount (LDAP and local),
+#       matching the NetBIOS form stored in ACEs
+#     - AppLocker : %PROGRAMFILES% expanded (+x86), separator-boundary
+#       path match, Allow AND Deny path rules parsed (Deny precedence)
+#     - RuleCollection EnforcementMode report (Exe/Dll/Script/Msi/Appx)
+#     - Bypass Candidates summary (Write+Execute under an Allow path)
+#     - Perf : HashSet group lookup, GetAccessControl(), -Force
 #
-#   NG+ changes (this revision) :
-#     - FIX effective access : explicit Allow now beats inherited Deny
-#       (was: any applicable Deny blocked -> false negatives)
-#     - FIX LDAP group identities resolved via SID->NTAccount
-#       (was: FQDN prefix -> never matched NetBIOS ACE identities)
-#     - FIX local-account groups resolved via SID->NTAccount
-#       (was: hardcoded BUILTIN\ prefix -> custom/machine groups missed)
-#     - FIX AppLocker path vars : %PROGRAMFILES% now expanded (+x86)
-#     - FIX AppLocker path match : separator-boundary compare
-#       (was: C:\Windows matched C:\WindowsApps ; wildcard metachar unescaped)
-#     - ADD RuleCollection EnforcementMode report (Exe/Dll/Script/Msi/Appx)
-#       -> shows which bypass classes are even enforced
-#     - ADD Bypass Candidates summary (Write+Execute AND under AL allow path)
-#
-#   Usage   :
-#     ./Lockdown-NG.ps1
-#     ./Lockdown-NG.ps1 -AllTargets
-#     ./Lockdown-NG.ps1 -Target "C:\Windows","C:\ProgramData"
-#     ./Lockdown-NG.ps1 -AllTargets -Output C:\results.txt
-#     ./Lockdown-NG.ps1 -AsUser "DOMAIN\john"
-#     ./Lockdown-NG.ps1 -AsUser "DOMAIN\john" -Groups "DOMAIN\IT Staff","BUILTIN\Users"
-#     ./Lockdown-NG.ps1 -AsUser "localjohn"
-#     ./Lockdown-NG.ps1 -AsUser "MACHINE\localjohn"
+#   Usage :
+#     ./Lockdown.ps1
+#     ./Lockdown.ps1 -AllTargets
+#     ./Lockdown.ps1 -Target "C:\Windows","C:\ProgramData"
+#     ./Lockdown.ps1 -AllTargets -Output C:\results.txt
+#     ./Lockdown.ps1 -AsUser "DOMAIN\john"
+#     ./Lockdown.ps1 -AsUser "DOMAIN\john" -Groups "DOMAIN\IT Staff","BUILTIN\Users"
+#     ./Lockdown.ps1 -AsUser "MACHINE\localjohn"
 # ============================================================
 
 [CmdletBinding()]
