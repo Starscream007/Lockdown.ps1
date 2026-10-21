@@ -18,6 +18,7 @@ In one run:
 - **Windows Defender posture** — running mode, real-time / behavior / on-access / network protection, tamper protection, cloud (MAPS) and sample-submission level, and signature staleness. Read attacker-first: a protection that is **on** is an obstacle, **off** is a window.
 - **ASR rules** — each configured Attack Surface Reduction rule reported by its action (Block / Audit / Warn / Disabled), so you see which classes are actually enforced versus merely logged.
 - **Defender exclusions** — path / extension / process exclusions, when readable.
+- **AMSI providers** — enumerates the registered AMSI providers (`HKLM\SOFTWARE\Microsoft\AMSI\Providers`), classifies Defender vs third-party, and flags any provider whose `InprocServer32` DLL does not resolve (a degraded AMSI chain). Detection by registration, not an in-process probe — see Limitations.
 - **AV-blind cross-reference** — any Write+Execute directory that also sits under a Defender `ExclusionPath` is flagged as a drop-and-run location where the AV is blind *and* execution control is permissive. This correlation is the point of the tool.
 - **Bypass Candidates** — a summary of directories usable for execution in the current context.
 - **LOLBAS availability** against the policy (`installutil`, `rundll32`, `regsvr32`, `mshta`, `wscript`, `cscript`, `msbuild`, `certutil`, `winget`, `regasm`).
@@ -125,6 +126,7 @@ Enforcement mode:
 Defender:
 - Each protection is `ON` (obstacle) or `OFF` (window); `Tamper protection: OFF` means Defender can be disabled outright.
 - ASR rules are reported by action: `Block` (enforced), `Audit` (logged, not blocked), `Warn` (user-bypassable), `Disabled`.
+- AMSI providers: `[baseline]` is Defender only with its DLL present; `[non-Defender AMSI hook]` (something else, e.g. an EDR, registers an AMSI provider) and `[AMSI degraded]` (a registered provider's DLL does not resolve) are the signals.
 - `[!] W+X dirs under a Defender exclusion` lists the AV-blind drop-and-run locations — the correlation result.
 
 ---
@@ -142,6 +144,7 @@ Defender:
 - Enumeration only. It finds and validates locations; it does not execute anything.
 - Enumeration works by **reading DACLs**. A directory where you have Write+Execute but not `READ_CONTROL` (you cannot read its security descriptor) is invisible to the tool — even though it may be a perfectly usable drop location, since write and execute do not require reading the DACL. Running elevated reads every DACL; as a plain low-priv user you only see the locations whose ACLs you are allowed to read.
 - **Defender exclusions are hidden from standard users** (Defender has suppressed `Get-MpPreference` exclusions for non-admins since ~2021). Under a low-priv context the exclusion list — and therefore the AV-blind cross-reference, the tool's flagship output — will usually come back empty. An empty result means *unreadable*, not *none*; it only lights up when you are admin, or on a host where the exclusion registry ACL is permissive.
+- The AMSI check is **registration-based**: it reports which providers are registered and whether each provider's DLL resolves on disk. It does **not** confirm AMSI is armed in the running process — that would need an active probe (the AMSI test string, or reflection on `AmsiUtils`), which is noisy and self-signaturing, and is deliberately out of scope for a passive recon tool.
 - ASR rules are reported by **action only**. The GUID→name mapping is not included, so you see a rule's enforcement state but not its friendly name.
 - Covers AppLocker **path** rules. Publisher and Hash rules are not parsed — a binary allowed by a Publisher rule may be reported as `not in allow`.
 - Default-rule writable directories under `%WINDIR%` are well-known; this tool confirms which ones *your* current context can actually use, it does not claim to discover new ones.
