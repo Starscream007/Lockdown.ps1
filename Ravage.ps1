@@ -577,8 +577,6 @@ $count = $findings.Count
 # An inherited finding folds under its nearest ancestor anchor ONLY when its
 # contributing principals are a subset of that anchor's -> a deeper dir that
 # exposes a NEW principal is never hidden, it becomes its own anchor.
-$findingByPath = @{}
-foreach ($f in $findings) { $findingByPath[$f.FullName] = $f }
 $anchorIdSets = @{}   # anchorPath -> HashSet[string] of its identities
 
 foreach ($f in ($findings | Sort-Object FullName)) {
@@ -1029,9 +1027,13 @@ if (-not $defPref) {
                     Write-Host "    [+] $id : Disabled" -ForegroundColor Green
                     if ($Output) { "    [+] $id : Disabled" | Add-Content $Output }
                 }
+                5 {
+                    Write-Host "    [+] $id : NotConfigured [not restricted]" -ForegroundColor Green
+                    if ($Output) { "    [+] $id : NotConfigured [not restricted]" | Add-Content $Output }
+                }
                 default {
-                    Write-Host "    [?] $id : action=$act [not configured/unknown]" -ForegroundColor DarkGray
-                    if ($Output) { "    [?] $id : action=$act [not configured/unknown]" | Add-Content $Output }
+                    Write-Host "    [?] $id : action=$act [unknown]" -ForegroundColor DarkGray
+                    if ($Output) { "    [?] $id : action=$act [unknown]" | Add-Content $Output }
                 }
             }
         }
