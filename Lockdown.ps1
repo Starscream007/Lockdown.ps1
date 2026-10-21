@@ -526,7 +526,8 @@ $lolbas = @(
     "cscript.exe",
     "msbuild.exe",
     "certutil.exe",
-    "winget.exe"
+    "winget.exe",
+    "regasm.exe"
 )
 
 Write-Host ""
@@ -555,6 +556,9 @@ foreach ($bin in $lolbas) {
                    Select-Object -First 1 -ExpandProperty FullName
     } elseif ($bin -eq "winget.exe") {
         $binPath = Get-ChildItem "$env:ProgramFiles\WindowsApps" -Recurse -Filter "winget.exe" -ErrorAction SilentlyContinue |
+                   Select-Object -First 1 -ExpandProperty FullName
+    } elseif ($bin -eq "regasm.exe") {
+        $binPath = Get-ChildItem "$env:windir\Microsoft.NET\Framework*" -Recurse -Filter ".exe" -ErrorAction SilentlyContinue |
                    Select-Object -First 1 -ExpandProperty FullName
     } else {
         $binPath = "$env:windir\System32\$bin"
@@ -770,9 +774,12 @@ if ($uniqueCandidates.Count -eq 0) {
         $dllMode    = if ($enforcementModes.ContainsKey("Dll"))    { $enforcementModes["Dll"] }    else { "NotConfigured" }
 
         $notes = @()
-        if ($exeMode -ne "Enabled" -or $scriptMode -ne "Enabled") {
-            $notes += "    [i] Exe=$exeMode / Script=$scriptMode : non-enforced classes may run without a bypass"
+        if ($exeMode -ne "Enabled") {
+            $notes += "    [i] Exe=$exeMode : non-enforced classes may run without a bypass"
         }
+        if ($scriptMode -ne "Enabled") {
+            $notes += "    [i] Script=$scriptMode : non-enforced classes may run without a bypass"
+        }       
         if ($dllMode -ne "Enabled") {
             $notes += "    [i] Dll=$dllMode : a DLL dropped in these dirs loads via regsvr32/rundll32 without a bypass"
         }
