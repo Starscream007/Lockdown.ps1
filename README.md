@@ -14,7 +14,7 @@ In one run:
 
 - **Effective Write+Execute ACL scan** per directory, resolved against the current user's group memberships (or a simulated principal).
 - **AppLocker path correlation** - each writable+executable directory is tagged against the policy's Allow and Deny path rules.
-- **Enforcement mode per rule collection** (Exe / Dll / Script / Msi / Appx) - tells you which bypass classes are actually enforced, and the rest of the output respects it (see below).
+- **Enforcement mode per rule collection** (Exe / Dll / Script / Msi / Appx), tells you which bypass classes are actually enforced, and the rest of the output respects it (see below).
 - **Bypass Candidates** - a deduplicated summary of directories usable for execution in the current context.
 - **LOLBAS availability** against the policy (`installutil`, `rundll32`, `regsvr32`, `mshta`, `wscript`, `cscript`, `msbuild`, `certutil`, `winget`).
 - **PowerShell Language Mode** (Full / Constrained / Restricted / NoLanguage).
@@ -31,7 +31,7 @@ These are the choices that make the output trustworthy. They are opinions about 
 A directory is only counted as writable if the user has `WriteData` (file creation). `AppendData / AddSubdirectory` is explicitly *not* treated as write - it lets you create a subfolder, not drop a payload. For a drop-and-run scenario this removes a class of false positives. (General-purpose modifiable-path finders such as PowerUp intentionally count subdirectory creation; this tool does not, because the use case is narrower.)
 
 **Write AND Execute, tested bitwise.**
-A directory qualifies only if the effective access grants both file-drop and execute. Rights are tested with bitwise masks, including generic masks (`GENERIC_EXECUTE` `0x20000000`, `GENERIC_ALL` `0x10000000`) that the .NET `FileSystemRights` enum does not expand - a string match on `.ToString()` misses them. (PowerUp and accesschk also resolve generic masks; this is correctness, not novelty.)
+A directory qualifies only if the effective access grants both file-drop and execute. Rights are tested with bitwise masks, including generic masks (`GENERIC_EXECUTE` `0x20000000`, `GENERIC_ALL` `0x10000000`) that the .NET `FileSystemRights` enum does not expand, a string match on `.ToString()` misses them. (PowerUp and accesschk also resolve generic masks; this is correctness, not novelty.)
 
 **Canonical ACL evaluation.**
 Effective access per right follows the Windows order: explicit Deny > explicit Allow > inherited Deny > inherited Allow. An explicit Allow correctly overrides an inherited Deny. ORing together Allow ACEs - a common shortcut - produces both false positives and false negatives.
