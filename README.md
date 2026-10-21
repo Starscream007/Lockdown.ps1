@@ -13,7 +13,7 @@ Part of the Decepticons offensive tooling suite.
 In one run:
 
 - **Effective Write+Execute ACL scan** per directory, resolved against the current user's group memberships (or a simulated principal).
-- **AppLocker path correlation** - each writable+executable directory is tagged against the policy's Allow and Deny path rules.
+- **AppLocker path correlation**, each writable+executable directory is tagged against the policy's Allow and Deny path rules.
 - **Enforcement mode per rule collection** (Exe / Dll / Script / Msi / Appx), tells you which bypass classes are actually enforced, and the rest of the output respects it (see below).
 - **Bypass Candidates** - a deduplicated summary of directories usable for execution in the current context.
 - **LOLBAS availability** against the policy (`installutil`, `rundll32`, `regsvr32`, `mshta`, `wscript`, `cscript`, `msbuild`, `certutil`, `winget`).
