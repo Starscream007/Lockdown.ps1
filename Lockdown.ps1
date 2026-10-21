@@ -1,12 +1,13 @@
 # ============================================================
-#   Lockdown.ps1
+#   Ravage.ps1
 #   Author  : Starscream
-#   Version : 2.0  (rewrite of the original Lockdown)
+#   Version : 2.0  (full rewrite)
 #   Purpose : Detection of directories with Write+Execute ACL
 #             accessible to low-priv users (AppLocker bypass)
 #             + LOLBAS check + AppLocker cache
 #             + PowerShell Language Mode detection (CLM/bypass implications)
 #             + PS v2 availability check
+#             + Windows Defender posture (mode, protections, ASR, exclusions)
 #             + user context simulation (domain or local)
 #
 #   v2 changes :
@@ -26,17 +27,23 @@
 #       is not actually gated -> LOLBAS and candidates reflect that instead
 #       of reporting everything as blocked / not-in-allow
 #     - RuleCollection EnforcementMode report (Exe/Dll/Script/Msi/Appx)
+#     - Windows Defender posture + ASR rules + exclusions, cross-referenced
+#       against bypass candidates (W+X dir under an exclusion = AV-blind)
+#     - Privileged principals (Administrators/SYSTEM/operators) dropped from
+#       the match set by default : an admin disables AppLocker, not evades it.
+#       -IncludePrivileged keeps them (raw view).
 #     - Bypass Candidates summary (Write+Execute, usable in context)
 #     - Perf : HashSet group lookup, GetAccessControl(), -Force
 #
 #   Usage :
-#     ./Lockdown.ps1
-#     ./Lockdown.ps1 -AllTargets
-#     ./Lockdown.ps1 -Target "C:\Windows","C:\ProgramData"
-#     ./Lockdown.ps1 -AllTargets -Output C:\results.txt
-#     ./Lockdown.ps1 -AsUser "DOMAIN\john"
-#     ./Lockdown.ps1 -AsUser "DOMAIN\john" -Groups "DOMAIN\IT Staff","BUILTIN\Users"
-#     ./Lockdown.ps1 -AsUser "MACHINE\localjohn"
+#     ./Ravage.ps1
+#     ./Ravage.ps1 -AllTargets
+#     ./Ravage.ps1 -Target "C:\Windows","C:\ProgramData"
+#     ./Ravage.ps1 -AllTargets -Output C:\results.txt
+#     ./Ravage.ps1 -AsUser "DOMAIN\john"
+#     ./Ravage.ps1 -AsUser "DOMAIN\john" -Groups "DOMAIN\IT Staff","BUILTIN\Users"
+#     ./Ravage.ps1 -AsUser "MACHINE\localjohn"
+#     ./Ravage.ps1 -IncludePrivileged
 # ============================================================
 
 [CmdletBinding()]
@@ -45,7 +52,8 @@ param(
     [string]$Output,
     [switch]$AllTargets,
     [string]$AsUser,
-    [string[]]$Groups
+    [string[]]$Groups,
+    [switch]$IncludePrivileged
 )
 
 # Targets
@@ -65,6 +73,9 @@ $count = 0
 
 # Collected bypass candidates (Write+Execute dirs usable for execution in context)
 $bypassCandidates = [System.Collections.Generic.List[string]]::new()
+
+# Defender exclusion paths, surfaced for cross-ref in Bypass Candidates
+$defenderExclusionPaths = @()
 
 # ------------------------------------------------------------
 #   Access-mask flags (NTFS FileSystemRights + generic bits)
@@ -108,14 +119,15 @@ function Resolve-EffectiveRight {
 # Banner
 Write-Host ""
 Write-Host "  ====================================================" -ForegroundColor DarkCyan
-Write-Host "   _     ___   ____ _  ______   _____         ___   _ " -ForegroundColor Cyan
-Write-Host "  | |   / _ \ / ___| |/ /  _ \ / _  \ \      / / \ | |" -ForegroundColor Cyan
-Write-Host "  | |  | | | | |   | ' /| | | | | | |\ \ /\ / /|  \| |" -ForegroundColor Cyan
-Write-Host "  | |__| |_| | |___| . \| |_| | |_| | \ V  V / | |\  |" -ForegroundColor Cyan
-Write-Host "  |_____\___/ \____|_|\_\____/ \___/   \_/\_/  |_| \_|" -ForegroundColor Cyan
+Write-Host "           ____      ___     ___    ____ _____ " -ForegroundColor Cyan
+Write-Host "          |  _ \    / \ \   / / \  / ___| ____|" -ForegroundColor Cyan
+Write-Host "          | |_) |  / _ \ \ / / _ \| |  _|  _|  " -ForegroundColor Cyan
+Write-Host "          |  _ <  / ___ \ V / ___ \ |_| | |___ " -ForegroundColor Cyan
+Write-Host "          |_| \_\/_/   \_\_/_/   \_\____|_____|" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "        by Starscream  |  Decepticons Suite"            -ForegroundColor Magenta
-Write-Host "               Peace through tyranny."                  -ForegroundColor Magenta
+Write-Host ""
+Write-Host "        Ravage eject Operation: infiltration.."       -ForegroundColor Magenta
 Write-Host "  ====================================================" -ForegroundColor DarkCyan
 Write-Host ""
 
@@ -210,11 +222,62 @@ if ($AsUser) {
                      Select-Object -ExpandProperty "Group Name"
 }
 
+# ------------------------------------------------------------
+#   Privileged-principal filter
+# ------------------------------------------------------------
+# A W+X dir writable by Administrators/SYSTEM/operators is not a bypass : an
+# admin disables AppLocker, it doesn't evade it. These principals are dropped
+# from the match set by default. -IncludePrivileged keeps them (raw view).
+# SID-based -> survives OS localization.
+$privilegedSids = @(
+    'S-1-5-32-544',  # Administrators
+    'S-1-5-18',      # Local System
+    'S-1-5-32-551',  # Backup Operators
+    'S-1-5-32-549',  # Server Operators
+    'S-1-5-32-550',  # Print Operators
+    'S-1-5-32-548',  # Account Operators
+    'S-1-5-32-552'   # Replicator
+)
+$privilegedNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+if (-not $IncludePrivileged) {
+    foreach ($sid in $privilegedSids) {
+        $nt = Resolve-SidToNTAccount $sid
+        if ($nt) { [void]$privilegedNames.Add($nt) }
+    }
+}
+
+# Real token elevated ? (only meaningful when not simulating)
+$isElevated = $false
+try {
+    $isElevated = ([System.Security.Principal.WindowsPrincipal] `
+        [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    ).IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+} catch { }
+
 # Fast membership lookup (O(1) vs -contains O(n) per ACE)
 $groupSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-foreach ($g in $currentGroups) { if ($g) { [void]$groupSet.Add($g) } }
+$droppedPriv = 0
+foreach ($g in $currentGroups) {
+    if (-not $g) { continue }
+    if ($privilegedNames.Contains($g)) { $droppedPriv++; continue }
+    [void]$groupSet.Add($g)
+}
 [void]$groupSet.Add("NT AUTHORITY\Authenticated Users")
 [void]$groupSet.Add("BUILTIN\Users")
+
+if ($droppedPriv -gt 0) {
+    Write-Host ""
+    Write-Host "   [!] $droppedPriv privileged principal(s) dropped from match set [-IncludePrivileged to keep]" -ForegroundColor Yellow
+    if ($Output) { "   [!] $droppedPriv privileged principal(s) dropped from match set [-IncludePrivileged to keep]" | Add-Content $Output }
+}
+if ($isElevated -and -not $simulationMode) {
+    Write-Host "   [i] Elevated token, no -AsUser : showing generic low-priv surface (Users + Authenticated Users)" -ForegroundColor DarkGray
+    Write-Host "       Pass -AsUser DOMAIN\user to scope to a real target's groups"                               -ForegroundColor DarkGray
+    if ($Output) {
+        "   [i] Elevated token, no -AsUser : showing generic low-priv surface (Users + Authenticated Users)" | Add-Content $Output
+        "       Pass -AsUser DOMAIN\user to scope to a real target's groups"                                  | Add-Content $Output
+    }
+}
 
 # ------------------------------------------------------------
 #   AppLocker policy (best-effort)
@@ -342,7 +405,7 @@ Write-Host "   AppLocker  : $alInfo"      -ForegroundColor $alColor
 Write-Host "  ============================================="        -ForegroundColor DarkCyan
 
 if ($Output) {
-    "Lockdown.ps1 | $(Get-Date -Format 'yyyy-MM-dd HH:mm')" | Out-File $Output
+    "Ravage.ps1 | $(Get-Date -Format 'yyyy-MM-dd HH:mm')" | Out-File $Output
     "User      : $userLabel"    | Add-Content $Output
     "Groups    : $groupSource"  | Add-Content $Output
     $currentGroups | ForEach-Object { "    $_" | Add-Content $Output }
@@ -412,10 +475,16 @@ $exeEnforced = $hasAppLocker -and
 # ------------------------------------------------------------
 #   ACL Scan (effective Write+Execute per directory)
 # ------------------------------------------------------------
+# Collect-then-render : the scan loop no longer prints. Each W+X directory is
+# pushed as a finding object; after the loop a collapse pass folds inherited
+# descendants under their nearest explicit (or inherited-root) ancestor so the
+# console shows anchors + counts instead of thousands of inherited leaves. The
+# -Output file still gets the full, un-collapsed listing (recon exhaustiveness).
+$findings = [System.Collections.Generic.List[object]]::new()
+
 foreach ($scanPath in $scanPaths) {
     Write-Host ""
     Write-Host "  [*] Analyzing $scanPath" -ForegroundColor Cyan
-    Write-Host ""
 
     $dirs = Get-ChildItem -LiteralPath $scanPath -Directory -Recurse -Force -ErrorAction SilentlyContinue
 
@@ -431,6 +500,7 @@ foreach ($scanPath in $scanPaths) {
             $inDenyW  = $false; $inDenyE  = $false
             $anyExplicit  = $false
             $contributors = [System.Collections.Generic.List[string]]::new()
+            $identities   = [System.Collections.Generic.List[string]]::new()  # distinct contributing principals (for collapse subset test)
 
             foreach ($ace in $acl.Access) {
                 $id = $ace.IdentityReference.Value
@@ -444,6 +514,7 @@ foreach ($scanPath in $scanPaths) {
                     if ($wx.Execute) { if ($inherited) { $inAllowE = $true } else { $exAllowE = $true } }
                     if ($wx.Write -or $wx.Execute) {
                         $contributors.Add("$id ($($ace.FileSystemRights))")
+                        if (-not $identities.Contains($id)) { $identities.Add($id) }
                         if (-not $inherited) { $anyExplicit = $true }
                     }
                 } else {   # Deny
@@ -457,10 +528,6 @@ foreach ($scanPath in $scanPaths) {
             $effE = Resolve-EffectiveRight $exAllowE $exDenyE $inAllowE $inDenyE
 
             if ($effW -and $effE) {
-
-                $aclTag   = if ($anyExplicit) { "[explicit]" } else { "[inherited]" }
-                $aclColor = if ($anyExplicit) { "Green" }      else { "DarkGray" }
-                $mainColor= if ($anyExplicit) { "Green" }      else { "Yellow" }
 
                 $alMatch     = Get-AppLockerMatch $dir.FullName
                 $isAllowPath = ($null -ne $alMatch) -and ($alMatch -ne $false) -and ($alMatch -ne "deny")
@@ -478,41 +545,145 @@ foreach ($scanPath in $scanPaths) {
                 # Bypass candidate = usable execution location :
                 #   - execution not enforced -> any W+X dir works
                 #   - enforced -> only under an Allow path, Deny excluded
-                if ((-not $exeEnforced) -or $isAllowPath) {
-                    [void]$bypassCandidates.Add($dir.FullName)
-                }
+                $isCandidate = ((-not $exeEnforced) -or $isAllowPath)
 
-                $count++
-
-                Write-Host "[+] $($dir.FullName)" -ForegroundColor $mainColor
-                $first = $true
-                foreach ($c in $contributors) {
-                    if ($first) { Write-Host "    Identity : $c" -ForegroundColor Cyan; $first = $false }
-                    else        { Write-Host "               $c" -ForegroundColor Cyan }
-                }
-                Write-Host "    Access   : Write+Execute [effective]" -ForegroundColor Yellow
-                Write-Host "    ACL      : $aclTag"                   -ForegroundColor $aclColor
-                if ($alTag) {
-                    Write-Host "    AppLocker: $alTag" -ForegroundColor $alTagColor
-                }
-                Write-Host ""
-
-                if ($Output) {
-                    "[+] $($dir.FullName)" | Add-Content $Output
-                    $first = $true
-                    foreach ($c in $contributors) {
-                        if ($first) { "    Identity : $c" | Add-Content $Output; $first = $false }
-                        else        { "               $c" | Add-Content $Output }
-                    }
-                    "    Access   : Write+Execute [effective]" | Add-Content $Output
-                    "    ACL      : $aclTag"                   | Add-Content $Output
-                    if ($alTag) { "    AppLocker: $alTag"      | Add-Content $Output }
-                    ""                                         | Add-Content $Output
-                }
+                $findings.Add([PSCustomObject]@{
+                    FullName     = $dir.FullName
+                    Contributors = $contributors
+                    Identities   = $identities
+                    IsExplicit   = $anyExplicit
+                    AlTag        = $alTag
+                    AlTagColor   = $alTagColor
+                    IsCandidate  = $isCandidate
+                    AnchorPath   = $null        # filled by collapse pass
+                })
             }
         } catch {
             # Access denied - silent
         }
+    }
+}
+
+$count = $findings.Count
+
+# ------------------------------------------------------------
+#   Collapse pass : assign each finding an anchor
+# ------------------------------------------------------------
+# Anchor = a finding that is shown on its own line. A finding is an anchor if it
+# carries an explicit ACE, OR it is inherited but has no qualifying ancestor
+# anchor (an "inherited root" : its writable parent wasn't itself a candidate).
+# An inherited finding folds under its nearest ancestor anchor ONLY when its
+# contributing principals are a subset of that anchor's -> a deeper dir that
+# exposes a NEW principal is never hidden, it becomes its own anchor.
+$findingByPath = @{}
+foreach ($f in $findings) { $findingByPath[$f.FullName] = $f }
+$anchorIdSets = @{}   # anchorPath -> HashSet[string] of its identities
+
+foreach ($f in ($findings | Sort-Object FullName)) {
+    if ($f.IsExplicit) {
+        $f.AnchorPath = $f.FullName
+        $set = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($i in $f.Identities) { [void]$set.Add($i) }
+        $anchorIdSets[$f.FullName] = $set
+        continue
+    }
+    # inherited : walk up to nearest ancestor anchor
+    $p      = Split-Path $f.FullName -Parent
+    $anchor = $null
+    while ($p) {
+        if ($anchorIdSets.ContainsKey($p)) { $anchor = $p; break }
+        $pp = Split-Path $p -Parent
+        if ($pp -eq $p) { break }
+        $p = $pp
+    }
+    $foldable = $false
+    if ($anchor) {
+        $aset = $anchorIdSets[$anchor]
+        $foldable = $true
+        foreach ($i in $f.Identities) { if (-not $aset.Contains($i)) { $foldable = $false; break } }
+    }
+    if ($foldable) {
+        $f.AnchorPath = $anchor
+    } else {
+        # becomes its own anchor (inherited root, or new-principal surface)
+        $f.AnchorPath = $f.FullName
+        $set = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($i in $f.Identities) { [void]$set.Add($i) }
+        $anchorIdSets[$f.FullName] = $set
+    }
+}
+
+# Count collapsed descendants per anchor (display-only)
+$descCount = @{}
+foreach ($f in $findings) {
+    if ($f.AnchorPath -ne $f.FullName) {
+        if (-not $descCount.ContainsKey($f.AnchorPath)) { $descCount[$f.AnchorPath] = 0 }
+        $descCount[$f.AnchorPath]++
+    }
+}
+
+# Helper : given a subset of findings, return the rows to show (anchors in the
+# subset + any orphans whose anchor is not in the subset), each with a count of
+# how many subset members fold under it. Used for the candidate and exclusion
+# summaries so they condense the same way the main listing does.
+function Get-CondensedRows {
+    param([object[]]$Items)
+    $inSet = @{}
+    foreach ($i in $Items) { $inSet[$i.FullName] = $true }
+    $cnt  = @{}
+    $rows = [System.Collections.Generic.List[string]]::new()
+    foreach ($i in ($Items | Sort-Object FullName)) {
+        if (($i.AnchorPath -eq $i.FullName) -or (-not $inSet.ContainsKey($i.AnchorPath))) {
+            if (-not $cnt.ContainsKey($i.FullName)) { $cnt[$i.FullName] = 0; [void]$rows.Add($i.FullName) }
+        } else {
+            if (-not $cnt.ContainsKey($i.AnchorPath)) { $cnt[$i.AnchorPath] = 0 }
+            $cnt[$i.AnchorPath]++
+        }
+    }
+    return ,($rows | ForEach-Object { [PSCustomObject]@{ Path = $_; Count = $cnt[$_] } })
+}
+
+# ------------------------------------------------------------
+#   Render : console condensed (anchors), -Output exhaustive (all)
+# ------------------------------------------------------------
+Write-Host ""
+if ($findings.Count -eq 0) {
+    Write-Host "  [-] no Write+Execute directory found in context" -ForegroundColor DarkGray
+} else {
+    foreach ($f in ($findings | Where-Object { $_.AnchorPath -eq $_.FullName } | Sort-Object FullName)) {
+        $mainColor = if ($f.IsExplicit) { "Green" } else { "Yellow" }
+        $aclColor  = if ($f.IsExplicit) { "Green" } else { "DarkGray" }
+        $aclTag    = if ($f.IsExplicit) { "[explicit]" } else { "[inherited]" }
+        $n         = if ($descCount.ContainsKey($f.FullName)) { $descCount[$f.FullName] } else { 0 }
+        $suffix    = if ($n -gt 0) { "  (+$n inherited)" } else { "" }
+
+        Write-Host "[+] $($f.FullName)$suffix" -ForegroundColor $mainColor
+        $first = $true
+        foreach ($c in $f.Contributors) {
+            if ($first) { Write-Host "    Identity : $c" -ForegroundColor Cyan; $first = $false }
+            else        { Write-Host "               $c" -ForegroundColor Cyan }
+        }
+        Write-Host "    Access   : Write+Execute [effective]" -ForegroundColor Yellow
+        Write-Host "    ACL      : $aclTag"                   -ForegroundColor $aclColor
+        if ($f.AlTag) { Write-Host "    AppLocker: $($f.AlTag)" -ForegroundColor $f.AlTagColor }
+        Write-Host ""
+    }
+}
+
+# File : full un-collapsed listing
+if ($Output) {
+    foreach ($f in ($findings | Sort-Object FullName)) {
+        $aclTag = if ($f.IsExplicit) { "[explicit]" } else { "[inherited]" }
+        "[+] $($f.FullName)" | Add-Content $Output
+        $first = $true
+        foreach ($c in $f.Contributors) {
+            if ($first) { "    Identity : $c" | Add-Content $Output; $first = $false }
+            else        { "               $c" | Add-Content $Output }
+        }
+        "    Access   : Write+Execute [effective]" | Add-Content $Output
+        "    ACL      : $aclTag"                   | Add-Content $Output
+        if ($f.AlTag) { "    AppLocker: $($f.AlTag)" | Add-Content $Output }
+        ""                                         | Add-Content $Output
     }
 }
 
@@ -558,7 +729,7 @@ foreach ($bin in $lolbas) {
         $binPath = Get-ChildItem "$env:ProgramFiles\WindowsApps" -Recurse -Filter "winget.exe" -ErrorAction SilentlyContinue |
                    Select-Object -First 1 -ExpandProperty FullName
     } elseif ($bin -eq "regasm.exe") {
-        $binPath = Get-ChildItem "$env:windir\Microsoft.NET\Framework*" -Recurse -Filter ".exe" -ErrorAction SilentlyContinue |
+        $binPath = Get-ChildItem "$env:windir\Microsoft.NET\Framework*" -Recurse -Filter "regasm.exe" -ErrorAction SilentlyContinue |
                    Select-Object -First 1 -ExpandProperty FullName
     } else {
         $binPath = "$env:windir\System32\$bin"
@@ -736,6 +907,174 @@ if (-not (Test-Path $cacheDir)) {
 }
 
 # ------------------------------------------------------------
+#   Windows Defender posture
+# ------------------------------------------------------------
+Write-Host ""
+Write-Host "  =============================================" -ForegroundColor DarkCyan
+Write-Host "   Windows Defender"                            -ForegroundColor Cyan
+Write-Host "  =============================================" -ForegroundColor DarkCyan
+Write-Host ""
+
+if ($Output) {
+    ""                 | Add-Content $Output
+    "Windows Defender" | Add-Content $Output
+    ""                 | Add-Content $Output
+}
+
+# Get-MpComputerStatus : readable by standard users on a default config.
+# Failure = Defender module absent, replaced by 3rd-party AV, or access denied.
+$defStatus = $null
+try { $defStatus = Get-MpComputerStatus -ErrorAction Stop } catch { }
+
+$defPref = $null
+try { $defPref = Get-MpPreference -ErrorAction Stop } catch { }
+
+if (-not $defStatus) {
+    Write-Host "    [?] Get-MpComputerStatus failed - module absent / 3rd-party AV / access denied" -ForegroundColor Yellow
+    if ($Output) { "    [?] Get-MpComputerStatus failed - module absent / 3rd-party AV / access denied" | Add-Content $Output }
+} else {
+
+    # Running mode : Normal = actively blocking ; Passive/SxS Passive = another AV
+    # is primary, Defender not blocking ; EDR Block = MDE block mode.
+    $mode = $defStatus.AMRunningMode
+    if ($mode -eq "Normal") {
+        Write-Host "    [!] Running mode       : $mode [actively blocking]" -ForegroundColor Red
+        if ($Output) { "    [!] Running mode       : $mode [actively blocking]" | Add-Content $Output }
+    } else {
+        Write-Host "    [+] Running mode       : $mode [not primary - reduced blocking]" -ForegroundColor Green
+        if ($Output) { "    [+] Running mode       : $mode [not primary - reduced blocking]" | Add-Content $Output }
+    }
+
+    # Per-protection. Convention : ON = Red (obstacle), OFF = Green (window).
+    $checks = @(
+        @{ Label = "Real-time protection"; Val = $defStatus.RealTimeProtectionEnabled },
+        @{ Label = "Behavior monitor";     Val = $defStatus.BehaviorMonitorEnabled   },
+        @{ Label = "On-access protection"; Val = $defStatus.OnAccessProtectionEnabled },
+        @{ Label = "NIS (network)";        Val = $defStatus.NISEnabled               },
+        @{ Label = "Tamper protection";    Val = $defStatus.IsTamperProtected        }
+    )
+    foreach ($c in $checks) {
+        if ($c.Val) {
+            $line = "    [!] {0,-20} : ON" -f $c.Label
+            Write-Host $line -ForegroundColor Red
+            if ($Output) { $line | Add-Content $Output }
+        } else {
+            $extra = if ($c.Label -eq "Tamper protection") { " [Defender can be disabled]" } else { "" }
+            $line  = "    [+] {0,-20} : OFF$extra" -f $c.Label
+            Write-Host $line -ForegroundColor Green
+            if ($Output) { $line | Add-Content $Output }
+        }
+    }
+
+    # Cloud / sample submission (higher = more telemetry to MS cloud)
+    if ($defPref) {
+        $maps   = switch ([int]$defPref.MAPSReporting)        { 0 {"Disabled"} 1 {"Basic"} 2 {"Advanced"} default {"$($defPref.MAPSReporting)"} }
+        $sample = switch ([int]$defPref.SubmitSamplesConsent) { 0 {"NeverSend"} 1 {"SendSafe"} 2 {"NeverSend(prompt)"} 3 {"SendAll"} default {"$($defPref.SubmitSamplesConsent)"} }
+        Write-Host "    [i] MAPS cloud         : $maps"   -ForegroundColor DarkCyan
+        Write-Host "    [i] Sample submission  : $sample" -ForegroundColor DarkCyan
+        if ($Output) {
+            "    [i] MAPS cloud         : $maps"   | Add-Content $Output
+            "    [i] Sample submission  : $sample" | Add-Content $Output
+        }
+    }
+
+    # Signature staleness (stale defs = weaker detection)
+    $sigDate = $defStatus.AntivirusSignatureLastUpdated
+    if ($sigDate) {
+        $ageDays = [math]::Round(((Get-Date) - $sigDate).TotalDays, 1)
+        $sigCol  = if ($ageDays -gt 7) { "Green" } else { "DarkGray" }
+        $sigTag  = if ($ageDays -gt 7) { "[stale]" } else { "" }
+        Write-Host "    [i] Signatures age     : $ageDays day(s) $sigTag" -ForegroundColor $sigCol
+        if ($Output) { "    [i] Signatures age     : $ageDays day(s) $sigTag" | Add-Content $Output }
+    }
+}
+
+# -- ASR rules (pragmatic : action only, no GUID->name table) --
+# Action codes : 0 Disabled | 1 Block | 2 Audit | 5 NotConfigured | 6 Warn
+# attacker-POV : Block = obstacle (Red) ; Audit/Disabled/Warn = window.
+Write-Host ""
+Write-Host "   -- ASR rules --" -ForegroundColor Cyan
+if ($Output) { "   -- ASR rules --" | Add-Content $Output }
+
+if (-not $defPref) {
+    Write-Host "    [?] Get-MpPreference failed - ASR unreadable" -ForegroundColor Yellow
+    if ($Output) { "    [?] Get-MpPreference failed - ASR unreadable" | Add-Content $Output }
+} else {
+    $asrIds  = @($defPref.AttackSurfaceReductionRules_Ids)     | Where-Object { $_ }
+    $asrAct  = @($defPref.AttackSurfaceReductionRules_Actions)
+
+    if ($asrIds.Count -eq 0) {
+        Write-Host "    [+] none configured [no ASR coverage]" -ForegroundColor Green
+        if ($Output) { "    [+] none configured [no ASR coverage]" | Add-Content $Output }
+    } else {
+        for ($i = 0; $i -lt $asrIds.Count; $i++) {
+            $id  = $asrIds[$i]
+            $act = if ($i -lt $asrAct.Count) { [int]$asrAct[$i] } else { -1 }
+            switch ($act) {
+                1 {
+                    Write-Host "    [!] $id : Block [enforced]" -ForegroundColor Red
+                    if ($Output) { "    [!] $id : Block [enforced]" | Add-Content $Output }
+                }
+                2 {
+                    Write-Host "    [+] $id : Audit [logged, not blocked]" -ForegroundColor Green
+                    if ($Output) { "    [+] $id : Audit [logged, not blocked]" | Add-Content $Output }
+                }
+                6 {
+                    Write-Host "    [~] $id : Warn [user-bypassable]" -ForegroundColor Yellow
+                    if ($Output) { "    [~] $id : Warn [user-bypassable]" | Add-Content $Output }
+                }
+                0 {
+                    Write-Host "    [+] $id : Disabled" -ForegroundColor Green
+                    if ($Output) { "    [+] $id : Disabled" | Add-Content $Output }
+                }
+                default {
+                    Write-Host "    [?] $id : action=$act [not configured/unknown]" -ForegroundColor DarkGray
+                    if ($Output) { "    [?] $id : action=$act [not configured/unknown]" | Add-Content $Output }
+                }
+            }
+        }
+    }
+}
+
+# -- Exclusions (highest-value) --
+# CAVEAT : since Defender ~2021 exclusions are hidden from standard users.
+# Empty under non-admin = "unreadable", NOT "none".
+Write-Host ""
+Write-Host "   -- Exclusions --" -ForegroundColor Cyan
+if ($Output) { "   -- Exclusions --" | Add-Content $Output }
+
+if (-not $defPref) {
+    Write-Host "    [?] Get-MpPreference failed - exclusions unreadable" -ForegroundColor Yellow
+    if ($Output) { "    [?] Get-MpPreference failed - exclusions unreadable" | Add-Content $Output }
+} else {
+    $exPath = @($defPref.ExclusionPath)      | Where-Object { $_ }
+    $exExt  = @($defPref.ExclusionExtension) | Where-Object { $_ }
+    $exProc = @($defPref.ExclusionProcess)   | Where-Object { $_ }
+    $total  = $exPath.Count + $exExt.Count + $exProc.Count
+
+    # surface path exclusions for Bypass Candidates cross-ref
+    $defenderExclusionPaths = @($exPath | ForEach-Object { $_.TrimEnd('\') })
+
+    if ($total -eq 0) {
+        Write-Host "    [?] none returned - either no exclusions, or hidden from non-admin" -ForegroundColor Yellow
+        if ($Output) { "    [?] none returned - either no exclusions, or hidden from non-admin" | Add-Content $Output }
+    } else {
+        foreach ($p in $exPath) {
+            Write-Host "    [+] path : $p" -ForegroundColor Green
+            if ($Output) { "    [+] path : $p" | Add-Content $Output }
+        }
+        foreach ($e in $exExt) {
+            Write-Host "    [+] ext  : $e" -ForegroundColor Green
+            if ($Output) { "    [+] ext  : $e" | Add-Content $Output }
+        }
+        foreach ($pr in $exProc) {
+            Write-Host "    [+] proc : $pr" -ForegroundColor Green
+            if ($Output) { "    [+] proc : $pr" | Add-Content $Output }
+        }
+    }
+}
+
+# ------------------------------------------------------------
 #   Bypass Candidates (prioritized summary)
 # ------------------------------------------------------------
 Write-Host ""
@@ -750,7 +1089,9 @@ if ($Output) {
     ""                   | Add-Content $Output
 }
 
-$uniqueCandidates = $bypassCandidates | Select-Object -Unique
+# Candidate findings (condensed for console, exhaustive for file)
+$candidateFindings = @($findings | Where-Object { $_.IsCandidate })
+$uniqueCandidates  = @($candidateFindings | ForEach-Object { $_.FullName } | Select-Object -Unique)
 
 if ($uniqueCandidates.Count -eq 0) {
     Write-Host "    [-] none : no usable Write+Execute location found" -ForegroundColor DarkGray
@@ -761,9 +1102,36 @@ if ($uniqueCandidates.Count -eq 0) {
         if ($Output) { "    [!] AppLocker policy unreadable - listing all W+X dirs (allow-path status unconfirmed)" | Add-Content $Output }
         Write-Host ""
     }
-    foreach ($c in $uniqueCandidates) {
-        Write-Host "    [+] $c" -ForegroundColor Green
-        if ($Output) { "    [+] $c" | Add-Content $Output }
+    # Console : condensed to anchors + collapsed count
+    foreach ($row in (Get-CondensedRows $candidateFindings)) {
+        $suffix = if ($row.Count -gt 0) { "  (+$($row.Count) inherited)" } else { "" }
+        Write-Host "    [+] $($row.Path)$suffix" -ForegroundColor Green
+    }
+    # File : exhaustive
+    if ($Output) {
+        foreach ($c in ($uniqueCandidates | Sort-Object)) { "    [+] $c" | Add-Content $Output }
+    }
+
+    # Cross-ref : W+X candidate under a Defender ExclusionPath = drop-and-run
+    # with AV blind + AppLocker permissive. Reuses Test-PathUnderAny.
+    if ($defenderExclusionPaths.Count -gt 0) {
+        $excludedFindings = @($candidateFindings | Where-Object { Test-PathUnderAny $_.FullName $defenderExclusionPaths })
+        if ($excludedFindings.Count -gt 0) {
+            Write-Host ""
+            Write-Host "    [!] W+X dirs under a Defender exclusion [AV-blind drop-and-run] :" -ForegroundColor Red
+            if ($Output) { "    [!] W+X dirs under a Defender exclusion [AV-blind drop-and-run] :" | Add-Content $Output }
+            # Console : condensed
+            foreach ($row in (Get-CondensedRows $excludedFindings)) {
+                $suffix = if ($row.Count -gt 0) { "  (+$($row.Count) inherited)" } else { "" }
+                Write-Host "        $($row.Path)$suffix" -ForegroundColor Red
+            }
+            # File : exhaustive
+            if ($Output) {
+                foreach ($x in ($excludedFindings | ForEach-Object { $_.FullName } | Sort-Object)) {
+                    "        $x" | Add-Content $Output
+                }
+            }
+        }
     }
 
     # Cross-reference execution enforcement : if Exe/Script not enforced,
@@ -779,7 +1147,7 @@ if ($uniqueCandidates.Count -eq 0) {
         }
         if ($scriptMode -ne "Enabled") {
             $notes += "    [i] Script=$scriptMode : non-enforced classes may run without a bypass"
-        }       
+        }
         if ($dllMode -ne "Enabled") {
             $notes += "    [i] Dll=$dllMode : a DLL dropped in these dirs loads via regsvr32/rundll32 without a bypass"
         }
@@ -796,11 +1164,12 @@ if ($uniqueCandidates.Count -eq 0) {
 # Footer
 Write-Host ""
 Write-Host "  =============================================" -ForegroundColor DarkCyan
-Write-Host "   $count director(ies) found | $($uniqueCandidates.Count) bypass candidate(s)" -ForegroundColor Yellow
+$anchorCount = ($findings | Where-Object { $_.AnchorPath -eq $_.FullName }).Count
+Write-Host "   $count director(ies) found | $($uniqueCandidates.Count) bypass candidate(s) | $anchorCount anchor(s) shown" -ForegroundColor Yellow
 if ($Output) {
     Write-Host "   Results exported : $Output"             -ForegroundColor DarkGray
 }
 Write-Host "  =============================================" -ForegroundColor DarkCyan
 Write-Host ""
-Write-Host "  Conquest is made of the ashes of one's enemies..." -ForegroundColor DarkCyan
+Write-Host "  Mission Accomplished, Decepticons forever !"  -ForegroundColor DarkCyan
 Write-Host ""
