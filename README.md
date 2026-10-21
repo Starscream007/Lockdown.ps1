@@ -2,7 +2,7 @@
 
 Execution-control reconnaissance for low-privilege contexts, in a single PowerShell pass with no external binary.
 
-Ravage enumerates directories a low-priv user can **write to and execute from**, cross-references them against the effective AppLocker policy **and the Windows Defender posture**, and reports whether a bypass is even required — or whether the location is simply invisible to the AV. It is an enumeration and correlation tool, **not a novel bypass**. The writable locations it finds under `%WINDIR%` and `%PROGRAMFILES%` are well documented; the value here is getting the *correctness* and the *correlation* right, in one artifact that runs in a constrained shell.
+Ravage enumerates directories a low-priv user can **write to and execute from**, cross-references them against the effective AppLocker policy **and the Windows Defender posture**, and reports whether a bypass is even required or whether the location is simply invisible to the AV. It is an enumeration and correlation tool, **not a novel bypass**. The writable locations it finds under `%WINDIR%` and `%PROGRAMFILES%` are well documented; the value here is getting the *correctness* and the *correlation* right, in one artifact that runs in a constrained shell.
 
 Part of the Decepticons offensive tooling suite.
 
