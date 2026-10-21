@@ -1074,6 +1074,83 @@ if (-not $defPref) {
     }
 }
 
+# -- AMSI providers --
+# Registered AMSI providers (HKLM\SOFTWARE\Microsoft\AMSI\Providers), each a CLSID
+# resolved to its InprocServer32 DLL. Standard-user readable, passive. Detection only :
+# this reports which providers are REGISTERED and whether their DLL resolves, NOT whether
+# AMSI is armed in the running process (that needs an active probe, out of scope).
+# Attacker-POV : baseline (Defender only, DLL present) stays quiet [i] ; the signal is a
+# non-Defender provider (something else hooks AMSI -> Red [!]) or a provider whose DLL
+# doesn't resolve (AMSI chain degraded -> Green [+] window). One verdict, expands on signal.
+Write-Host ""
+Write-Host "   -- AMSI providers --" -ForegroundColor Cyan
+if ($Output) { "   -- AMSI providers --" | Add-Content $Output }
+
+$amsiDefenderClsid = '{2781761E-28E0-4109-99FE-B9D127C57AFE}'   # Defender (MpOav)
+$amsiProviderKey   = 'HKLM:\SOFTWARE\Microsoft\AMSI\Providers'
+$amsiProviders     = $null
+try {
+    $amsiProviders = @(Get-ChildItem $amsiProviderKey -ErrorAction Stop | ForEach-Object { $_.PSChildName })
+} catch { $amsiProviders = $null }
+
+# Resolve a provider CLSID to its InprocServer32 DLL path (native + WOW64), expanded.
+function Resolve-AmsiProviderDll {
+    param([string]$clsid)
+    foreach ($base in @('HKLM:\SOFTWARE\Classes\CLSID', 'HKLM:\SOFTWARE\WOW6432Node\Classes\CLSID')) {
+        try {
+            $raw = (Get-ItemProperty "$base\$clsid\InprocServer32" -ErrorAction Stop).'(default)'
+            if ($raw) {
+                $raw = ($raw -replace '^"|"$', '')
+                return [System.Environment]::ExpandEnvironmentVariables($raw)
+            }
+        } catch { }
+    }
+    return $null
+}
+
+if ($null -eq $amsiProviders) {
+    Write-Host "    [?] AMSI\Providers key absent or unreadable" -ForegroundColor Yellow
+    if ($Output) { "    [?] AMSI\Providers key absent or unreadable" | Add-Content $Output }
+} elseif ($amsiProviders.Count -eq 0) {
+    Write-Host "    [+] no AMSI provider registered [AMSI unarmed]" -ForegroundColor Green
+    if ($Output) { "    [+] no AMSI provider registered [AMSI unarmed]" | Add-Content $Output }
+} else {
+    $thirdParty  = @()
+    $degraded    = @()
+    $hasDefender = $false
+    foreach ($clsid in $amsiProviders) {
+        $isDefender = ($clsid -eq $amsiDefenderClsid)
+        if ($isDefender) { $hasDefender = $true }
+        $dll   = Resolve-AmsiProviderDll $clsid
+        $dllOk = $dll -and (Test-Path $dll -ErrorAction SilentlyContinue)
+        if (-not $isDefender) { $thirdParty += [PSCustomObject]@{ Clsid = $clsid; Dll = $dll } }
+        if (-not $dllOk)      { $degraded   += [PSCustomObject]@{ Clsid = $clsid; Dll = $dll } }
+    }
+
+    # Baseline verdict line (quiet when nothing stands out)
+    if ($thirdParty.Count -eq 0 -and $degraded.Count -eq 0 -and $hasDefender) {
+        Write-Host "    [i] Defender only, DLL resolves [baseline]" -ForegroundColor DarkCyan
+        if ($Output) { "    [i] Defender only, DLL resolves [baseline]" | Add-Content $Output }
+    } else {
+        $defState = if ($hasDefender) { "Defender present" } else { "Defender absent" }
+        Write-Host "    [i] $($amsiProviders.Count) provider(s) registered [$defState]" -ForegroundColor DarkCyan
+        if ($Output) { "    [i] $($amsiProviders.Count) provider(s) registered [$defState]" | Add-Content $Output }
+    }
+
+    # Signal : non-Defender provider (something else hooks AMSI)
+    foreach ($tp in $thirdParty) {
+        $d = if ($tp.Dll) { $tp.Dll } else { "<unresolved>" }
+        Write-Host "    [!] third-party provider $($tp.Clsid) -> $d [non-Defender AMSI hook]" -ForegroundColor Red
+        if ($Output) { "    [!] third-party provider $($tp.Clsid) -> $d [non-Defender AMSI hook]" | Add-Content $Output }
+    }
+    # Signal : provider whose DLL doesn't resolve (AMSI chain degraded for that provider)
+    foreach ($dg in $degraded) {
+        $d = if ($dg.Dll) { $dg.Dll } else { "<no InprocServer32>" }
+        Write-Host "    [+] provider DLL unresolved $($dg.Clsid) -> $d [AMSI degraded]" -ForegroundColor Green
+        if ($Output) { "    [+] provider DLL unresolved $($dg.Clsid) -> $d [AMSI degraded]" | Add-Content $Output }
+    }
+}
+
 # ------------------------------------------------------------
 #   Bypass Candidates (prioritized summary)
 # ------------------------------------------------------------
