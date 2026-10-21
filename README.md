@@ -18,7 +18,7 @@ In one run:
 - **Windows Defender posture** — running mode, real-time / behavior / on-access / network protection, tamper protection, cloud (MAPS) and sample-submission level, and signature staleness. Read attacker-first: a protection that is **on** is an obstacle, **off** is a window.
 - **ASR rules** — each configured Attack Surface Reduction rule reported by its action (Block / Audit / Warn / Disabled), so you see which classes are actually enforced versus merely logged.
 - **Defender exclusions** — path / extension / process exclusions, when readable.
-- **AMSI providers** — enumerates the registered AMSI providers (`HKLM\SOFTWARE\Microsoft\AMSI\Providers`), classifies Defender vs third-party, and flags any provider whose `InprocServer32` DLL does not resolve (a degraded AMSI chain). Detection by registration, not an in-process probe — see Limitations.
+- **AMSI** — answers *is AMSI in place, and whose*. By default (read-only) it enumerates the registered AMSI providers (`HKLM\SOFTWARE\Microsoft\AMSI\Providers`), resolves each `InprocServer32` DLL, and reports whether a working provider is registered and whether it is Defender or a third party (and flags any registered provider whose DLL does not resolve — a degraded chain). An opt-in `-AmsiProbe` additionally feeds the benign AMSI test sentinel to AMSI in the current shell to confirm it is actually armed — the only way to catch userland/EDR hooking that registers no provider. See Limitations for what each layer can and cannot see.
 - **AV-blind cross-reference** — any Write+Execute directory that also sits under a Defender `ExclusionPath` is flagged as a drop-and-run location where the AV is blind *and* execution control is permissive. This correlation is the point of the tool.
 - **Bypass Candidates** — a summary of directories usable for execution in the current context.
 - **LOLBAS availability** against the policy (`installutil`, `rundll32`, `regsvr32`, `mshta`, `wscript`, `cscript`, `msbuild`, `certutil`, `winget`, `regasm`).
@@ -90,6 +90,9 @@ Everything is native PowerShell. Nothing to drop on the target (which may itself
 
 # keep privileged principals in the match set (raw view)
 ./Ravage.ps1 -IncludePrivileged
+
+# actively confirm whether AMSI is armed in this shell (generates an AMSI detection event)
+./Ravage.ps1 -AmsiProbe
 ```
 
 | Parameter            | Description                                                            |
@@ -100,6 +103,7 @@ Everything is native PowerShell. Nothing to drop on the target (which may itself
 | `-AsUser`            | Simulate another user's access. Groups resolved via LDAP, or local via WinNT. |
 | `-Groups`            | Supply the simulated user's groups manually (skips LDAP).              |
 | `-IncludePrivileged` | Keep Administrators / SYSTEM / operator groups in the match set (default: dropped). |
+| `-AmsiProbe`         | Actively test whether AMSI is armed in the current shell. **Generates an AMSI detection event** (possible EDR response) — opt-in, off by default. |
 
 ---
 
@@ -126,7 +130,7 @@ Enforcement mode:
 Defender:
 - Each protection is `ON` (obstacle) or `OFF` (window); `Tamper protection: OFF` means Defender can be disabled outright.
 - ASR rules are reported by action: `Block` (enforced), `Audit` (logged, not blocked), `Warn` (user-bypassable), `Disabled`.
-- AMSI providers: `[baseline]` is Defender only with its DLL present; `[non-Defender AMSI hook]` (something else, e.g. an EDR, registers an AMSI provider) and `[AMSI degraded]` (a registered provider's DLL does not resolve) are the signals.
+- AMSI: `AMSI active : Defender` / `Defender + third-party` / `third-party only, Defender absent` names a working provider and whose it is; `no working provider registered [effectively unarmed]` means none resolves; a `[degraded]` sub-line is a registered provider whose DLL is missing. With `-AmsiProbe`: `sentinel BLOCKED -> AMSI armed in this shell` (or `sentinel ran -> AMSI NOT armed`) is the active confirmation.
 - `[!] W+X dirs under a Defender exclusion` lists the AV-blind drop-and-run locations — the correlation result.
 
 ---
@@ -144,7 +148,8 @@ Defender:
 - Enumeration only. It finds and validates locations; it does not execute anything.
 - Enumeration works by **reading DACLs**. A directory where you have Write+Execute but not `READ_CONTROL` (you cannot read its security descriptor) is invisible to the tool — even though it may be a perfectly usable drop location, since write and execute do not require reading the DACL. Running elevated reads every DACL; as a plain low-priv user you only see the locations whose ACLs you are allowed to read.
 - **Defender exclusions are hidden from standard users** (Defender has suppressed `Get-MpPreference` exclusions for non-admins since ~2021). Under a low-priv context the exclusion list — and therefore the AV-blind cross-reference, the tool's flagship output — will usually come back empty. An empty result means *unreadable*, not *none*; it only lights up when you are admin, or on a host where the exclusion registry ACL is permissive.
-- The AMSI check is **registration-based**: it reports which providers are registered and whether each provider's DLL resolves on disk. It does **not** confirm AMSI is armed in the running process — that would need an active probe (the AMSI test string, or reflection on `AmsiUtils`), which is noisy and self-signaturing, and is deliberately out of scope for a passive recon tool.
+- The default AMSI check is **registration-based**: it reports which providers are registered and whether each provider's DLL resolves on disk. It does **not**, on its own, confirm AMSI is armed in the running process — an EDR that hooks AMSI in userland without registering a provider is invisible to it, so a clean registration verdict is not an AMSI all-clear.
+- `-AmsiProbe` closes that gap but is **opt-in and active**: it feeds the benign AMSI test sentinel to AMSI in the current shell. If AMSI is armed the scan blocks it (that's the confirmation), which **generates an AMSI detection event** — on a real engagement the target's EDR may alert or auto-isolate the host. It is never run by default for that reason, not because of noise. The sentinel is assembled at runtime so the script file itself carries no flaggable string and is not quarantined on load. This is detection, not a bypass.
 - ASR rules are reported by **action only**. The GUID→name mapping is not included, so you see a rule's enforcement state but not its friendly name.
 - Covers AppLocker **path** rules. Publisher and Hash rules are not parsed — a binary allowed by a Publisher rule may be reported as `not in allow`.
 - Default-rule writable directories under `%WINDIR%` are well-known; this tool confirms which ones *your* current context can actually use, it does not claim to discover new ones.
