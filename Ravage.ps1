@@ -44,6 +44,7 @@
 #     ./Ravage.ps1 -AsUser "DOMAIN\john" -Groups "DOMAIN\IT Staff","BUILTIN\Users"
 #     ./Ravage.ps1 -AsUser "MACHINE\localjohn"
 #     ./Ravage.ps1 -IncludePrivileged
+#     ./Ravage.ps1 -AmsiProbe          # active AMSI check (generates a detection event)
 # ============================================================
 
 [CmdletBinding()]
@@ -53,7 +54,8 @@ param(
     [switch]$AllTargets,
     [string]$AsUser,
     [string[]]$Groups,
-    [switch]$IncludePrivileged
+    [switch]$IncludePrivileged,
+    [switch]$AmsiProbe
 )
 
 # Targets
@@ -1074,17 +1076,20 @@ if (-not $defPref) {
     }
 }
 
-# -- AMSI providers --
-# Registered AMSI providers (HKLM\SOFTWARE\Microsoft\AMSI\Providers), each a CLSID
-# resolved to its InprocServer32 DLL. Standard-user readable, passive. Detection only :
-# this reports which providers are REGISTERED and whether their DLL resolves, NOT whether
-# AMSI is armed in the running process (that needs an active probe, out of scope).
-# Attacker-POV : baseline (Defender only, DLL present) stays quiet [i] ; the signal is a
-# non-Defender provider (something else hooks AMSI -> Red [!]) or a provider whose DLL
-# doesn't resolve (AMSI chain degraded -> Green [+] window). One verdict, expands on signal.
+# -- AMSI --
+# Two layers, answering "is AMSI in place, and whose" :
+#   (1) registration (default) : read HKLM\SOFTWARE\Microsoft\AMSI\Providers, resolve each
+#       CLSID's InprocServer32 DLL, classify Defender vs third-party. Verdict = is a working
+#       provider registered, and is it Defender or another. Read-only : never triggers a
+#       control, never breaks. Blind spot : an EDR that hooks AMSI in userland WITHOUT a
+#       registered provider is invisible here -> a clean verdict is NOT an AMSI all-clear.
+#   (2) active probe (-AmsiProbe) : feed the benign AMSI test sentinel to AMSI in THIS shell.
+#       Blocked -> AMSI is armed here ; not blocked -> not armed. This is the only way to
+#       catch userland hooking, but it GENERATES an AMSI detection event (the engagement's
+#       EDR may alert or auto-isolate the host) -> opt-in, never default.
 Write-Host ""
-Write-Host "   -- AMSI providers --" -ForegroundColor Cyan
-if ($Output) { "   -- AMSI providers --" | Add-Content $Output }
+Write-Host "   -- AMSI --" -ForegroundColor Cyan
+if ($Output) { "   -- AMSI --" | Add-Content $Output }
 
 $amsiDefenderClsid = '{2781761E-28E0-4109-99FE-B9D127C57AFE}'   # Defender (MpOav)
 $amsiProviderKey   = 'HKLM:\SOFTWARE\Microsoft\AMSI\Providers'
@@ -1108,46 +1113,86 @@ function Resolve-AmsiProviderDll {
     return $null
 }
 
+# (1) Registration verdict
 if ($null -eq $amsiProviders) {
     Write-Host "    [?] AMSI\Providers key absent or unreadable" -ForegroundColor Yellow
     if ($Output) { "    [?] AMSI\Providers key absent or unreadable" | Add-Content $Output }
-} elseif ($amsiProviders.Count -eq 0) {
-    Write-Host "    [+] no AMSI provider registered [AMSI unarmed]" -ForegroundColor Green
-    if ($Output) { "    [+] no AMSI provider registered [AMSI unarmed]" | Add-Content $Output }
 } else {
-    $thirdParty  = @()
-    $degraded    = @()
-    $hasDefender = $false
+    $defenderOk   = $false      # Defender provider registered AND its DLL resolves
+    $thirdPartyOk = @()         # non-Defender providers whose DLL resolves
+    $degraded     = @()         # providers registered but DLL does not resolve
     foreach ($clsid in $amsiProviders) {
-        $isDefender = ($clsid -eq $amsiDefenderClsid)
-        if ($isDefender) { $hasDefender = $true }
         $dll   = Resolve-AmsiProviderDll $clsid
         $dllOk = $dll -and (Test-Path $dll -ErrorAction SilentlyContinue)
-        if (-not $isDefender) { $thirdParty += [PSCustomObject]@{ Clsid = $clsid; Dll = $dll } }
-        if (-not $dllOk)      { $degraded   += [PSCustomObject]@{ Clsid = $clsid; Dll = $dll } }
+        if ($clsid -eq $amsiDefenderClsid) {
+            if ($dllOk) { $defenderOk = $true }
+        } elseif ($dllOk) {
+            $thirdPartyOk += [PSCustomObject]@{ Clsid = $clsid; Dll = $dll }
+        }
+        if (-not $dllOk) { $degraded += [PSCustomObject]@{ Clsid = $clsid; Dll = $dll } }
     }
 
-    # Baseline verdict line (quiet when nothing stands out)
-    if ($thirdParty.Count -eq 0 -and $degraded.Count -eq 0 -and $hasDefender) {
-        Write-Host "    [i] Defender only, DLL resolves [baseline]" -ForegroundColor DarkCyan
-        if ($Output) { "    [i] Defender only, DLL resolves [baseline]" | Add-Content $Output }
+    # Verdict line : in place or not, and whose
+    if ($defenderOk -and $thirdPartyOk.Count -gt 0) {
+        Write-Host "    [!] AMSI active : Defender + third-party [registration]" -ForegroundColor Red
+        if ($Output) { "    [!] AMSI active : Defender + third-party [registration]" | Add-Content $Output }
+    } elseif ($defenderOk) {
+        Write-Host "    [!] AMSI active : Defender [registration]" -ForegroundColor Red
+        if ($Output) { "    [!] AMSI active : Defender [registration]" | Add-Content $Output }
+    } elseif ($thirdPartyOk.Count -gt 0) {
+        Write-Host "    [!] AMSI active : third-party only, Defender absent [registration]" -ForegroundColor Red
+        if ($Output) { "    [!] AMSI active : third-party only, Defender absent [registration]" | Add-Content $Output }
     } else {
-        $defState = if ($hasDefender) { "Defender present" } else { "Defender absent" }
-        Write-Host "    [i] $($amsiProviders.Count) provider(s) registered [$defState]" -ForegroundColor DarkCyan
-        if ($Output) { "    [i] $($amsiProviders.Count) provider(s) registered [$defState]" | Add-Content $Output }
+        Write-Host "    [+] AMSI : no working provider registered [effectively unarmed]" -ForegroundColor Green
+        if ($Output) { "    [+] AMSI : no working provider registered [effectively unarmed]" | Add-Content $Output }
     }
 
-    # Signal : non-Defender provider (something else hooks AMSI)
-    foreach ($tp in $thirdParty) {
-        $d = if ($tp.Dll) { $tp.Dll } else { "<unresolved>" }
-        Write-Host "    [!] third-party provider $($tp.Clsid) -> $d [non-Defender AMSI hook]" -ForegroundColor Red
-        if ($Output) { "    [!] third-party provider $($tp.Clsid) -> $d [non-Defender AMSI hook]" | Add-Content $Output }
+    # Detail : which third-party, and any degraded (registered-but-DLL-broken) provider
+    foreach ($tp in $thirdPartyOk) {
+        Write-Host "        third-party provider $($tp.Clsid) -> $($tp.Dll)" -ForegroundColor Red
+        if ($Output) { "        third-party provider $($tp.Clsid) -> $($tp.Dll)" | Add-Content $Output }
     }
-    # Signal : provider whose DLL doesn't resolve (AMSI chain degraded for that provider)
     foreach ($dg in $degraded) {
         $d = if ($dg.Dll) { $dg.Dll } else { "<no InprocServer32>" }
-        Write-Host "    [+] provider DLL unresolved $($dg.Clsid) -> $d [AMSI degraded]" -ForegroundColor Green
-        if ($Output) { "    [+] provider DLL unresolved $($dg.Clsid) -> $d [AMSI degraded]" | Add-Content $Output }
+        Write-Host "        [+] provider DLL unresolved $($dg.Clsid) -> $d [degraded]" -ForegroundColor Green
+        if ($Output) { "        [+] provider DLL unresolved $($dg.Clsid) -> $d [degraded]" | Add-Content $Output }
+    }
+
+    # Fixed caveat : registration cannot see userland/EDR hooking
+    Write-Host "    [i] registration-level : does not detect userland/EDR AMSI hooking without a registered provider" -ForegroundColor DarkGray
+    if ($Output) { "    [i] registration-level : does not detect userland/EDR AMSI hooking without a registered provider" | Add-Content $Output }
+    if (-not $AmsiProbe) {
+        Write-Host "        use -AmsiProbe to actively test this shell (generates an AMSI detection event)" -ForegroundColor DarkGray
+        if ($Output) { "        use -AmsiProbe to actively test this shell (generates an AMSI detection event)" | Add-Content $Output }
+    }
+}
+
+# (2) Active probe : opt-in, deliberate. The benign AMSI test sentinel is rebuilt from char
+# codes at runtime (no literal in the source -> this script is not self-flagged on load),
+# then fed to AMSI as a string literal. If AMSI is armed in THIS process the scan blocks it
+# and the call throws -> armed ; otherwise it returns -> not armed. This is detection, not a
+# bypass. It DOES create an AMSI detection event for this process.
+if ($AmsiProbe) {
+    $amsiProbeCodes = @(65,77,83,73,32,84,101,115,116,32,83,97,109,112,108,101,58,32,55,101,55,50,99,51,99,101,45,56,54,49,98,45,52,51,51,57,45,56,55,52,48,45,48,97,99,49,52,56,52,99,49,51,56,54)
+    $sentinel = -join ($amsiProbeCodes | ForEach-Object { [char][int]$_ })
+    $armed    = $null   # $true armed, $false not armed, $null inconclusive
+    try {
+        # Feed the sentinel to the scripting engine as a plain string literal. Benign to run;
+        # only AMSI (if armed) objects to its content.
+        $null  = Invoke-Expression ("'" + $sentinel + "'")
+        $armed = $false
+    } catch {
+        $armed = $true
+    }
+    if ($armed -eq $true) {
+        Write-Host "    [!] -AmsiProbe : sentinel BLOCKED -> AMSI armed in this shell" -ForegroundColor Red
+        if ($Output) { "    [!] -AmsiProbe : sentinel BLOCKED -> AMSI armed in this shell" | Add-Content $Output }
+    } elseif ($armed -eq $false) {
+        Write-Host "    [+] -AmsiProbe : sentinel ran -> AMSI NOT armed in this shell" -ForegroundColor Green
+        if ($Output) { "    [+] -AmsiProbe : sentinel ran -> AMSI NOT armed in this shell" | Add-Content $Output }
+    } else {
+        Write-Host "    [?] -AmsiProbe : inconclusive" -ForegroundColor Yellow
+        if ($Output) { "    [?] -AmsiProbe : inconclusive" | Add-Content $Output }
     }
 }
 
